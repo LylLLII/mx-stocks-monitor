@@ -24,6 +24,7 @@ import os
 import stat
 import sys
 import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -210,9 +211,14 @@ MAPPING = [
     ("退市股", "退市股"),
     ("戴帽预期(新规)", "戴帽预期(新规)"),
 ]
+T1_COLS = [
+    "次日_跟踪状态", "次日_跟踪日期",
+    "次日_开盘涨跌幅", "次日_午间涨跌幅", "次日_收盘涨跌幅",
+    "次日_最高涨跌幅", "次日_最低涨跌幅", "次日_形态",
+]
 MASTER_COLS = [m[0] for m in MAPPING] + [
     "首次入选日期", "首次入选时间", "最近入选时间", "入选次数", "入选扫描时间点"
-]
+] + T1_COLS
 
 
 def now_shanghai() -> datetime:
@@ -417,6 +423,221 @@ def _scan_once(pool, force):
     return True
 
 
+# ---------------- T+1 次日表现跟踪 ----------------
+# 思路：在股票「首次入选日的下一个交易日（T+1）」收盘后，抓取当天 OHLC + 11:30 午间价，
+# 以昨收为基准换算涨跌幅，覆盖"上午涨下午跌"的日内路径（不只看收盘）。
+# 数据源：腾讯自选股公开行情接口（qt.gtimg.cn 实时 + web.ifzq.gtimg.cn 分时），
+# 全部以「元」为单位，无东方财富 push2 的 ×100 单位错位问题，且沙箱连通性更稳。
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _http_get_json(url, params=None, timeout=15.0, retries=3):
+    import time as _t
+    last = None
+    for attempt in range(retries):
+        try:
+            r = httpx.get(url, params=params, timeout=timeout,
+                          headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                _t.sleep(1.5 * (attempt + 1))
+    print(f"[跟踪] 请求失败 {url}: {last}")
+    return None
+
+
+def _http_get_text(url, timeout=15.0, retries=3):
+    """腾讯 qt.gtimg.cn 返回纯文本（v_xxx="1~..."），需按文本解析。"""
+    import time as _t
+    last = None
+    for attempt in range(retries):
+        try:
+            r = httpx.get(url, timeout=timeout,
+                          headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                _t.sleep(1.5 * (attempt + 1))
+    print(f"[跟踪] 请求失败 {url}: {last}")
+    return None
+
+
+def _tx_prefix(code, plate):
+    """腾讯行情代码前缀：上交所/科创板用 sh，深交所/北交所用 sz。"""
+    p = plate or ""
+    if ("上交所" in p) or ("沪" in p) or ("科创" in p):
+        return "sh"
+    return "sz"  # 深交所、北交所及默认
+
+
+def _next_trading_day(d):
+    """返回 d 之后的第一个交易日（排除周末与法定节假日）。"""
+    try:
+        import chinese_calendar as cn
+        nd = d
+        while True:
+            nd = nd + timedelta(days=1)
+            if cn.is_workday(nd):
+                return nd
+    except Exception:
+        pass
+    nd = d
+    while True:
+        nd = nd + timedelta(days=1)
+        if nd.weekday() < 5:
+            return nd
+
+
+def _fetch_live(code, plate):
+    """腾讯实时行情（qt.gtimg.cn）：现价/最高/最低/今开/昨收，单位均为元。
+    返回字段：price 现价, high 最高, low 最低, open 今开, prev_close 昨收。"""
+    pre = _tx_prefix(code, plate)
+    text = _http_get_text(f"https://qt.gtimg.cn/q={pre}{code}")
+    if not text:
+        return None
+    m = re.search(r'"([^"]*)"', text)
+    if not m:
+        return None
+    f = m.group(1).split("~")
+    if len(f) < 35:
+        return None
+    return {
+        "price": _num(f[3]),       # 现价
+        "prev_close": _num(f[4]),  # 昨收（作为 T+1 涨跌幅基准）
+        "open": _num(f[5]),        # 今开
+        "high": _num(f[33]),       # 最高
+        "low": _num(f[34]),        # 最低
+    }
+
+
+def _fetch_mid_price(code, plate, target):
+    """取目标日 11:30 的「原始价格（元）」，涨跌幅在调用处用同一 prev_close 计算，
+    从源头避免单位错位。返回价格或 None。
+    腾讯分时接口（web.ifzq.gtimg.cn）只返回最近一个交易日的数据；
+    本函数仅用于 target == today 的收盘后跟踪，故天然命中目标日。"""
+    pre = _tx_prefix(code, plate)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={pre}{code}"
+    d = _http_get_json(url)
+    if not d:
+        return None
+    node = d.get("data", {}).get(f"{pre}{code}", {}).get("data")
+    if not isinstance(node, dict):
+        return None
+    # 交易日校验：仅当接口返回日 == 目标日才采信（防止跨日脏数据）
+    if str(node.get("date")) != target.strftime("%Y%m%d"):
+        return None
+    rows = node.get("data") or []
+    best = None
+    for row in rows:
+        parts = str(row).split()
+        if len(parts) < 2:
+            continue
+        t = parts[0]              # "HHMM"（无冒号）
+        if t <= "1130":
+            best = _num(parts[1])
+    if best is None:
+        # 兜底：取 11:30 之后第一条（部分标的午间无独立点）
+        for row in rows:
+            parts = str(row).split()
+            if len(parts) >= 2 and parts[0] >= "1130":
+                return _num(parts[1])
+        return None
+    return best
+
+
+def _classify_shape(open_p, mid_p, close_p, high_p, low_p):
+    try:
+        o = float(open_p); c = float(close_p)
+        h = float(high_p) if high_p not in (None, "") else None
+        l = float(low_p) if low_p not in (None, "") else None
+    except (TypeError, ValueError):
+        return "数据不足"
+    m = None
+    try:
+        if mid_p not in (None, ""):
+            m = float(mid_p)
+    except (TypeError, ValueError):
+        m = None
+    # 上午涨、下午跌（用户核心场景），需要午间数据
+    if m is not None and m > 0 and c < m - 0.5:
+        return "冲高回落" if (h is not None and h > max(m, c) + 1) else "上午涨下午跌"
+    if o > 0.5 and c > o:
+        return "高开高走"
+    if o > 0.5 and c < o:
+        return "高开低走"
+    if o < -0.5 and c > o:
+        return "低开高走"
+    if o < -0.5 and c < o:
+        return "低开低走"
+    return "震荡收涨" if c >= 0 else "震荡收跌"
+
+
+def track_followups(pool, force):
+    """对池中每只股票，在其 T+1 日收盘后记录次日表现；返回是否有变更。"""
+    now = now_shanghai()
+    today = now.date()
+    after_close = now.time() >= datetime.strptime("15:00", "%H:%M").time()
+    changed = False
+    for code, ex in pool.items():
+        if (ex.get("次日_跟踪状态") or "") == "已跟踪":
+            continue
+        first_s = (ex.get("首次入选日期") or "").strip()
+        if not first_s:
+            continue
+        try:
+            first_d = datetime.strptime(first_s, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        target = _next_trading_day(first_d)
+        if target > today:
+            continue                      # 还没到 T+1
+        if target < today:               # 错过窗口（如当日未运行）
+            if (ex.get("次日_跟踪状态") or "") != "已过期":
+                ex["次日_跟踪状态"] = "已过期"
+                ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+                changed = True
+            continue
+        # target == today：仅收盘后（或 --force）抓取，确保有完整 OHLC
+        if not (after_close or force):
+            continue
+        plate = ex.get("上市板块") or ""
+        live = _fetch_live(code, plate)
+        if not live or not live.get("prev_close"):
+            print(f"[跟踪] {code} 取昨收失败，跳过")
+            continue
+        prev = live["prev_close"]
+        mid_price = _fetch_mid_price(code, plate, target)  # 11:30 原始价（元）
+
+        def _pct(v):
+            return round((float(v) - prev) / prev * 100, 2) if v is not None else ""
+        open_p = _pct(live.get("open"))
+        high_p = _pct(live.get("high"))
+        low_p = _pct(live.get("low"))
+        close_p = _pct(live.get("price"))
+        mid_p = _pct(mid_price)
+        shape = _classify_shape(open_p, mid_p, close_p, high_p, low_p)
+        ex["次日_跟踪状态"] = "已跟踪"
+        ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+        ex["次日_开盘涨跌幅"] = open_p
+        ex["次日_午间涨跌幅"] = mid_p if mid_p is not None else ""
+        ex["次日_收盘涨跌幅"] = close_p
+        ex["次日_最高涨跌幅"] = high_p
+        ex["次日_最低涨跌幅"] = low_p
+        ex["次日_形态"] = shape
+        changed = True
+        print(f"[跟踪] {code} T+1 已记录: 开{open_p} 午{mid_p} 收{close_p} 高{high_p} 低{low_p} [{shape}]")
+    return changed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="忽略交易时段守卫")
@@ -440,8 +661,9 @@ def main():
         while _time.monotonic() < deadline:
             try:
                 _scan_once(pool, args.force)
+                track_followups(pool, args.force)  # 顺带处理 T+1 跟踪（收盘后抓取）
             except Exception as e:
-                print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次扫描失败，跳过本次迭代: {e}")
+                print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次迭代失败，跳过: {e}")
             iterations += 1
             if _time.monotonic() + interval < deadline:
                 _time.sleep(interval)
@@ -452,21 +674,19 @@ def main():
         git_sync_after()  # 统一 commit+push 一次，与云端互不冲突
         return
 
-    # 单次模式（兼容本地手动跑 / 测试）
+    # 单次模式：先处理 T+1 跟踪（不受交易时段限制，收盘后也可跑），再视情况选股
+    track_followups(pool, args.force)
     now = now_shanghai()
     if not args.force and not in_trading_hours(now):
-        print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，本次不执行。")
-        return
-    try:
-        rows = run_screener()
-    except Exception as e:
-        print(f"[错误] 扫描失败，本次运行中止: {e}")
-        return
-    print(f"[结果] 本次命中 {len(rows)} 只")
-    if not rows:
-        print("[结束] 本次无新增命中，观察池不变。")
-        return
-    _merge_rows(pool, rows, now)
+        print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，仅处理 T+1 跟踪，不执行选股扫描。")
+    else:
+        try:
+            rows = run_screener()
+            print(f"[结果] 本次命中 {len(rows)} 只")
+            if rows:
+                _merge_rows(pool, rows, now)
+        except Exception as e:
+            print(f"[错误] 扫描失败: {e}")
     _write_pool(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
     git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
