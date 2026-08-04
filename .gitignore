@@ -1,0 +1,16 @@
+# WorkBuddy 内部目录（含项目记忆，不入库）
+.workbuddy/
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时筛选输出（脚本运行时产生，无需版本控制）
+mx_stocks_screener/_*/
+mx_stocks_screener/_tmp/
+mx_stocks_screener/mx_stocks_screener_*.csv
+mx_stocks_screener/mx_stocks_screener_*_description.txt
+auth_qr.png
+
+# 仅保留观察池（跨机同步的核心数据）
+!mx_stocks_screener/观察池_累计.csv
