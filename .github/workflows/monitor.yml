@@ -1,0 +1,47 @@
+name: 妙想选股观察池监控（云端）
+
+on:
+  schedule:
+    # 北京时间交易时段（UTC 表示）
+    - cron: '*/5 1-3 * * 1-5'   # 09:30-11:30 北京时间
+    - cron: '*/5 5-7 * * 1-5'   # 13:00-15:00 北京时间
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略交易时段守卫（测试用）'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          EM_API_KEY: ${{ secrets.EM_API_KEY }}
+        run: python screener_monitor.py ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+
+      - name: Commit & push pool
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add mx_stocks_screener/观察池_累计.csv
+          git diff --cached --quiet || git commit -m "ci: 更新观察池 $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')"
+          git push
