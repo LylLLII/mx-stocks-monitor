@@ -11,8 +11,18 @@
 
 > 改条件：编辑 `screener_monitor.py` 顶部的 `QUERY` 一处即可，监控与定时任务都会跟着变。
 
-## 在任意一台电脑部署
-前置：Python 3.10+、已装 WorkBuddy（用于建定时任务）。
+## 云端自动运行（主力，无需本机开机）
+仓库已配置 GitHub Actions（`.github/workflows/monitor.yml`），在**交易时段自动每 5 分钟**扫码筛选并写回观察池：
+
+- 盘前盘后自动静默（脚本内置交易时段守卫：9:30–11:30 / 13:00–15:00，跳过周末与午休）。
+- `EM_API_KEY` 存在仓库 **Secret** 里，云端自带授权，不依赖你本机。
+- 仓库已设为**公开**，公开仓库 GitHub Actions 免费额度不限分钟数，全天跑也无压力。
+- 想手动触发一次：在仓库 `Actions` 页点 `Run workflow`（可勾选 `force` 忽略交易时段守卫）。
+
+所以：**你上班、下班、关机都不影响监控**，观察池由云端持续维护。
+
+## 在任意一台电脑部署（可选，用于手动补扫 / 测试）
+前置：Python 3.10+。本机运行**不是必须的**——只是备用。
 
 ```bash
 # 1) 拉取仓库
@@ -25,14 +35,14 @@ pip install -r requirements.txt
 # 3) 首次运行 → 打印/生成授权二维码，手机扫码授权 → 再运行一次即生效
 python screener_monitor.py --force
 
-# 4) 在 WorkBuddy 建一个定时任务：工作日每 2 分钟执行
-#    python <仓库路径>/screener_monitor.py
-#    （脚本会自动跳过非交易时段：9:30–11:30 / 13:00–15:00，周末与午休静默）
+# 之后手动跑（不守交易时段时用 --force；守交易时段直接不带参数）：
+python screener_monitor.py --force
 ```
 
 - `EM_API_KEY` 仅保存在本机 `~/.mx-skills/em_api_key`，**不进仓库**；
   每台机器首次运行需扫码授权一次，之后免授权。
-- 手动跑一次（不守交易时段）：`python screener_monitor.py --force`
+- 脚本已内置 git 自动同步：**运行前先 `pull` 云端最新观察池，运行后再 `commit + push` 合并结果**，
+  所以偶尔手动跑一次也不会和云端冲突，两份数据互为补充。
 
 ## 观察池文件
 `mx_stocks_screener/观察池_累计.csv`
@@ -47,12 +57,10 @@ python screener_monitor.py --force
 | 入选扫描时间点 | 所有命中时刻，如 `2026-08-04 10:30;2026-08-04 14:30` |
 
 ## 跨机同步观察池
-两台电脑都 clone 同一仓库后，用 git 同步观察池：
+观察池就是仓库里的 `mx_stocks_screener/观察池_累计.csv`，由 git 维护：
 
-```bash
-git pull            # 单位电脑：先拉家里电脑纳入的新票
-# 运行监控 ...
-git add mx_stocks_screener/观察池_累计.csv && git commit -m "更新观察池" && git push
-```
+- **主力同步**靠云端 GitHub Actions 自动 `commit + push`，你基本不用管。
+- **手动补跑**时脚本会自动 `pull`（运行前）和 `push`（运行后），见上文。
+- 单位/家里电脑想看最新清单，随时 `git pull` 即可。
 
-这样家里和单位看到的是同一份累计清单。
+这样云端和两台电脑看到的是同一份累计清单。

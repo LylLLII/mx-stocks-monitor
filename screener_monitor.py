@@ -338,12 +338,39 @@ def load_master() -> dict:
     return pool
 
 
+def _git(args):
+    """best-effort git 调用，失败仅提示，不中断监控。"""
+    try:
+        import subprocess
+        r = subprocess.run(["git"] + args, cwd=str(WORKSPACE),
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout).strip().replace("\n", " ")
+            print(f"[git] 跳过: {' '.join(args)} -> {msg[:160]}")
+        return r.returncode == 0
+    except Exception as e:
+        print(f"[git] 跳过: {e}")
+        return False
+
+
+def git_sync_before():
+    _git(["pull", "--no-edit"])
+
+
+def git_sync_after():
+    _git(["add", str(MASTER_CSV)])
+    if _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
+        _git(["pull", "--rebase", "--no-edit"])
+        _git(["push"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="忽略交易时段守卫")
     args = ap.parse_args()
 
     now = now_shanghai()
+    git_sync_before()  # 拉取云端最新观察池，保证本地与仓库一致
     if not args.force and not in_trading_hours(now):
         print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，本次不执行。")
         return
@@ -389,6 +416,7 @@ def main():
 
     print(f"[累计] 观察池共 {len(pool)} 只 | 本次新增 {len(added)}: {added} | 刷新 {len(updated)}: {updated}")
     print(f"[文件] {MASTER_CSV}")
+    git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
 
 
 if __name__ == "__main__":
