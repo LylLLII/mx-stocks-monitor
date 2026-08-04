@@ -438,7 +438,10 @@ def main():
         deadline = _time.monotonic() + max_sec
         iterations = 0
         while _time.monotonic() < deadline:
-            _scan_once(pool, args.force)
+            try:
+                _scan_once(pool, args.force)
+            except Exception as e:
+                print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次扫描失败，跳过本次迭代: {e}")
             iterations += 1
             if _time.monotonic() + interval < deadline:
                 _time.sleep(interval)
@@ -454,7 +457,11 @@ def main():
     if not args.force and not in_trading_hours(now):
         print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，本次不执行。")
         return
-    rows = run_screener()
+    try:
+        rows = run_screener()
+    except Exception as e:
+        print(f"[错误] 扫描失败，本次运行中止: {e}")
+        return
     print(f"[结果] 本次命中 {len(rows)} 只")
     if not rows:
         print("[结束] 本次无新增命中，观察池不变。")
