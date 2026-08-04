@@ -1,0 +1,31 @@
+name: 腾讯接口连通性探针
+
+# 用途：验证腾讯自选股行情接口（gtimg 实时 / ifzq 分时 / ifzq day 回溯）从
+# GitHub Actions runner（海外 IP）可达且字段正常。失败则运行变红。
+# 手动在 Actions 页面点 "Run workflow" 即可验证云端网络；
+# 另每日收盘后(北京15:35)跑一次做轻量持续监控。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '35 7 * * 1-5'   # 北京时间 15:35（UTC 7:35），收盘后
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Probe Tencent endpoints
+        run: python probe_tencent.py

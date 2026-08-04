@@ -581,14 +581,93 @@ def _classify_shape(open_p, mid_p, close_p, high_p, low_p):
     return "震荡收涨" if c >= 0 else "震荡收跌"
 
 
+def _fetch_day_minutes(code, plate, target):
+    """用 day/query 回溯目标日（最近 ~5 交易日）的分时，返回原始价(元)字典：
+    open/high/low/close/mid + prev_close(目标日昨收，取前一交易日收盘)。
+    分时接口只能取最近几天，故仅对近期错过的 T+1 可补抓；返回 None 表示超窗口/无数据。"""
+    pre = _tx_prefix(code, plate)
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/day/query?code={pre}{code}"
+    d = _http_get_json(url)
+    if not d:
+        return None
+    days = d.get("data", {}).get(f"{pre}{code}", {}).get("data") or []
+    if not isinstance(days, list):
+        return None
+    tgt_s = target.strftime("%Y%m%d")
+    for i, day in enumerate(days):
+        if not isinstance(day, dict) or day.get("date") != tgt_s:
+            continue
+        rows = day.get("data") or []
+        prices = []
+        for row in rows:
+            parts = str(row).split()
+            if len(parts) < 2:
+                continue
+            p = _num(parts[1])
+            if p is not None:
+                prices.append((parts[0], p))
+        if not prices:
+            return None
+        open_p = prices[0][1]
+        close_p = prices[-1][1]
+        high_p = max(p for _, p in prices)
+        low_p = min(p for _, p in prices)
+        mid = None
+        for t, p in prices:
+            if t <= "1130":
+                mid = p
+        prev_close = None
+        if i + 1 < len(days):           # 列表按日期降序，下一项即前一交易日
+            nxt = days[i + 1]
+            if isinstance(nxt, dict):
+                nrows = nxt.get("data") or []
+                if nrows:
+                    last = str(nrows[-1]).split()
+                    if len(last) >= 2:
+                        prev_close = _num(last[1])
+        return {"open": open_p, "high": high_p, "low": low_p, "close": close_p,
+                "mid": mid, "prev_close": prev_close}
+    return None
+
+
+def _apply_t1(ex, target, prev, o, h, l, c, m, status):
+    """用统一 prev_close 把原始价换算为涨跌幅并写入 T1 字段，返回形态。"""
+    def _pct(v):
+        return round((float(v) - prev) / prev * 100, 2) if v is not None else ""
+    open_p = _pct(o)
+    high_p = _pct(h)
+    low_p = _pct(l)
+    close_p = _pct(c)
+    mid_p = _pct(m)
+    shape = _classify_shape(open_p, mid_p, close_p, high_p, low_p)
+    ex["次日_跟踪状态"] = status
+    ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+    ex["次日_开盘涨跌幅"] = open_p
+    ex["次日_午间涨跌幅"] = mid_p if mid_p is not None else ""
+    ex["次日_收盘涨跌幅"] = close_p
+    ex["次日_最高涨跌幅"] = high_p
+    ex["次日_最低涨跌幅"] = low_p
+    ex["次日_形态"] = shape
+    return shape
+
+
+# 本次运行内 T+1 当天应抓但取数失败的股票（用于 CI ::error:: 告警，避免静默丢失）
+T1_FETCH_FAILURES = []
+
 def track_followups(pool, force):
-    """对池中每只股票，在其 T+1 日收盘后记录次日表现；返回是否有变更。"""
+    """对池中每只股票，在其 T+1 日收盘后记录次日表现；返回是否有变更。
+    - target==today：优先 gtimg 实时+分时；gtimg 失败则 day/query 同源兜底。
+    - target<today（错过窗口）：用 day/query 回溯补抓（最近~5交易日有效），
+      成功标"已补抓"，超窗口/无数据才标"已过期"（仍可后续重试）。
+    取数失败记入 T1_FETCH_FAILURES 并打印 ::error::，使 CI 运行变红可见。"""
+    global T1_FETCH_FAILURES
+    T1_FETCH_FAILURES = []
     now = now_shanghai()
     today = now.date()
     after_close = now.time() >= datetime.strptime("15:00", "%H:%M").time()
     changed = False
     for code, ex in pool.items():
-        if (ex.get("次日_跟踪状态") or "") == "已跟踪":
+        if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓"):
             continue
         first_s = (ex.get("首次入选日期") or "").strip()
         if not first_s:
@@ -597,45 +676,56 @@ def track_followups(pool, force):
             first_d = datetime.strptime(first_s, "%Y-%m-%d").date()
         except Exception:
             continue
+        plate = ex.get("上市板块") or ""
         target = _next_trading_day(first_d)
         if target > today:
             continue                      # 还没到 T+1
-        if target < today:               # 错过窗口（如当日未运行）
-            if (ex.get("次日_跟踪状态") or "") != "已过期":
-                ex["次日_跟踪状态"] = "已过期"
-                ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+        if target < today:               # 错过窗口：尝试用 day/query 回溯补抓
+            kb = _fetch_day_minutes(code, plate, target)
+            if kb and kb.get("prev_close"):
+                shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
+                                  kb["high"], kb["low"], kb["close"], kb["mid"], "已补抓")
                 changed = True
+                print(f"[补抓] {code} T+1 回溯成功: 开{ex['次日_开盘涨跌幅']} 午{ex['次日_午间涨跌幅']} 收{ex['次日_收盘涨跌幅']} 高{ex['次日_最高涨跌幅']} 低{ex['次日_最低涨跌幅']} [{shape}]")
+            else:
+                if (ex.get("次日_跟踪状态") or "") != "已过期":
+                    ex["次日_跟踪状态"] = "已过期"
+                    ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+                    changed = True
+                print(f"::warning::T+1 回溯失败(超回溯窗口或无数据): {code}")
             continue
-        # target == today：仅收盘后（或 --force）抓取，确保有完整 OHLC
+        # target == today：仅收盘后（或 --force）抓取，确保完整 OHLC
         if not (after_close or force):
             continue
-        plate = ex.get("上市板块") or ""
         live = _fetch_live(code, plate)
         if not live or not live.get("prev_close"):
-            print(f"[跟踪] {code} 取昨收失败，跳过")
+            kb = _fetch_day_minutes(code, plate, target)   # gtimg 失败，同源兜底
+            if kb and kb.get("prev_close"):
+                shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
+                                  kb["high"], kb["low"], kb["close"], kb["mid"], "已跟踪")
+                changed = True
+                print(f"[跟踪] {code} T+1 已记录(day/query兜底): {ex['次日_开盘涨跌幅']}/{ex['次日_午间涨跌幅']}/{ex['次日_收盘涨跌幅']} [{shape}]")
+                continue
+            print(f"::error::T+1 取数失败(当日应抓): {code} 取不到昨收/实时行情")
+            T1_FETCH_FAILURES.append(code)
             continue
         prev = live["prev_close"]
         mid_price = _fetch_mid_price(code, plate, target)  # 11:30 原始价（元）
-
-        def _pct(v):
-            return round((float(v) - prev) / prev * 100, 2) if v is not None else ""
-        open_p = _pct(live.get("open"))
-        high_p = _pct(live.get("high"))
-        low_p = _pct(live.get("low"))
-        close_p = _pct(live.get("price"))
-        mid_p = _pct(mid_price)
-        shape = _classify_shape(open_p, mid_p, close_p, high_p, low_p)
-        ex["次日_跟踪状态"] = "已跟踪"
-        ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
-        ex["次日_开盘涨跌幅"] = open_p
-        ex["次日_午间涨跌幅"] = mid_p if mid_p is not None else ""
-        ex["次日_收盘涨跌幅"] = close_p
-        ex["次日_最高涨跌幅"] = high_p
-        ex["次日_最低涨跌幅"] = low_p
-        ex["次日_形态"] = shape
+        shape = _apply_t1(ex, target, prev, live.get("open"), live.get("high"),
+                          live.get("low"), live.get("price"), mid_price, "已跟踪")
+        if ex["次日_午间涨跌幅"] == "":
+            print(f"::warning::T+1 午间价缺失(其余字段正常): {code}")
         changed = True
-        print(f"[跟踪] {code} T+1 已记录: 开{open_p} 午{mid_p} 收{close_p} 高{high_p} 低{low_p} [{shape}]")
+        print(f"[跟踪] {code} T+1 已记录: 开{ex['次日_开盘涨跌幅']} 午{ex['次日_午间涨跌幅']} 收{ex['次日_收盘涨跌幅']} 高{ex['次日_最高涨跌幅']} 低{ex['次日_最低涨跌幅']} [{shape}]")
     return changed
+
+
+def _report_t1_failures():
+    """T+1 取数失败的收尾告警：让 CI 运行变红，但不影响已完成的 git 同步。"""
+    if T1_FETCH_FAILURES:
+        codes = ",".join(T1_FETCH_FAILURES)
+        print(f"::error::T+1 跟踪存在 {len(T1_FETCH_FAILURES)} 只当日应抓却取数失败: {codes}")
+        sys.exit(1)
 
 
 def main():
@@ -672,6 +762,7 @@ def main():
         _write_pool(pool)
         print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
         git_sync_after()  # 统一 commit+push 一次，与云端互不冲突
+        _report_t1_failures()
         return
 
     # 单次模式：先处理 T+1 跟踪（不受交易时段限制，收盘后也可跑），再视情况选股
@@ -690,6 +781,7 @@ def main():
     _write_pool(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
     git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
+    _report_t1_failures()
 
 
 if __name__ == "__main__":
