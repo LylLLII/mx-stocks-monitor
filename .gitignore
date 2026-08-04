@@ -11,6 +11,7 @@ mx_stocks_screener/_tmp/
 mx_stocks_screener/mx_stocks_screener_*.csv
 mx_stocks_screener/mx_stocks_screener_*_description.txt
 auth_qr.png
+*auth_qr.png
 
 # 仅保留观察池（跨机同步的核心数据）
 !mx_stocks_screener/观察池_累计.csv
