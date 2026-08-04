@@ -364,28 +364,11 @@ def git_sync_after():
         _git(["push"])
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--force", action="store_true", help="忽略交易时段守卫")
-    args = ap.parse_args()
-
-    now = now_shanghai()
-    git_sync_before()  # 拉取云端最新观察池，保证本地与仓库一致
-    if not args.force and not in_trading_hours(now):
-        print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，本次不执行。")
-        return
-
-    print(f"[执行] {now:%Y-%m-%d %H:%M} 拉取妙想选股 ...")
-    rows = run_screener()
-    print(f"[结果] 本次命中 {len(rows)} 只")
-    if not rows:
-        print("[结束] 本次无新增命中，观察池不变。")
-        return
-
+def _merge_rows(pool, rows, now):
+    """把本次命中合并进 pool（in-memory），返回 (added, updated) 代码列表。"""
     ts = now.strftime("%Y-%m-%d %H:%M")
     date = now.strftime("%Y-%m-%d")
     time = now.strftime("%H:%M")
-    pool = load_master()
     added, updated = [], []
     for m in rows:
         code = m["代码"]
@@ -406,7 +389,10 @@ def main():
             pts.append(ts)
             ex["入选扫描时间点"] = ";".join(pts)
             updated.append(code)
+    return added, updated
 
+
+def _write_pool(pool):
     MASTER_CSV.parent.mkdir(parents=True, exist_ok=True)
     with MASTER_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=MASTER_COLS, extrasaction="ignore")
@@ -414,8 +400,68 @@ def main():
         for r in pool.values():
             w.writerow(r)
 
-    print(f"[累计] 观察池共 {len(pool)} 只 | 本次新增 {len(added)}: {added} | 刷新 {len(updated)}: {updated}")
-    print(f"[文件] {MASTER_CSV}")
+
+def _scan_once(pool, force):
+    """单次扫描并合并；返回是否有命中。"""
+    now = now_shanghai()
+    if not force and not in_trading_hours(now):
+        print(f"[跳过] {now:%Y-%m-%d %H:%M} 非交易时段")
+        return False
+    print(f"[执行] {now:%Y-%m-%d %H:%M} 拉取妙想选股 ...")
+    rows = run_screener()
+    print(f"[结果] 本次命中 {len(rows)} 只")
+    if not rows:
+        return False
+    added, updated = _merge_rows(pool, rows, now)
+    print(f"[累计] 本次新增 {len(added)}: {added} | 刷新 {len(updated)}: {updated}")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--force", action="store_true", help="忽略交易时段守卫")
+    ap.add_argument("--loop", action="store_true",
+                    help="单次运行内循环扫描（云端密集模式，约每2分钟一次）")
+    ap.add_argument("--loop-interval", type=int, default=120,
+                    help="循环间隔秒（默认120）")
+    ap.add_argument("--loop-max-seconds", type=int, default=240,
+                    help="单次运行最长持续秒（默认240，须<300避免与下次触发重叠）")
+    args = ap.parse_args()
+
+    git_sync_before()  # 拉取云端最新观察池（单次 pull；循环内只在内存累计，结束再统一写回）
+    pool = load_master()
+
+    if args.loop:
+        import time as _time
+        interval = max(10, int(args.loop_interval))
+        max_sec = min(int(args.loop_max_seconds), 295)
+        deadline = _time.monotonic() + max_sec
+        iterations = 0
+        while _time.monotonic() < deadline:
+            _scan_once(pool, args.force)
+            iterations += 1
+            if _time.monotonic() + interval < deadline:
+                _time.sleep(interval)
+            else:
+                break
+        _write_pool(pool)
+        print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
+        git_sync_after()  # 统一 commit+push 一次，与云端互不冲突
+        return
+
+    # 单次模式（兼容本地手动跑 / 测试）
+    now = now_shanghai()
+    if not args.force and not in_trading_hours(now):
+        print(f"[跳过] 当前 {now:%Y-%m-%d %H:%M} 非交易时段，本次不执行。")
+        return
+    rows = run_screener()
+    print(f"[结果] 本次命中 {len(rows)} 只")
+    if not rows:
+        print("[结束] 本次无新增命中，观察池不变。")
+        return
+    _merge_rows(pool, rows, now)
+    _write_pool(pool)
+    print(f"[累计] 观察池共 {len(pool)} 只")
     git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
 
 
