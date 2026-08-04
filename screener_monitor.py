@@ -360,7 +360,7 @@ def git_sync_before():
 def git_sync_after():
     _git(["add", str(MASTER_CSV)])
     if _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
-        _git(["pull", "--rebase", "--no-edit"])
+        _git(["pull", "--no-edit"])
         _git(["push"])
 
 
