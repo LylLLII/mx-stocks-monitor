@@ -997,7 +997,7 @@ def main():
     ap.add_argument("--renew", action="store_true",
                     help="本地续期 EM_API_KEY（扫码一次，自动推送到仓库 Secret）")
     ap.add_argument("--no-push", action="store_true",
-                    help="本地镜像模式：只 pull 不 push，避免与云端（唯一写入方）冲突")
+                    help="本地镜像模式：云端为主力时，本地只 pull 最新CSV供离线查看，不扫描不推送（避免与云端抢同一文件）")
     args = ap.parse_args()
 
     global _NO_PUSH
@@ -1005,6 +1005,13 @@ def main():
 
     if args.renew:
         cmd_renew()
+        return
+
+    if args.no_push:
+        # 云端为主力写入时的本地镜像模式：只拉取最新 CSV 供离线查看，
+        # 不扫描、不写盘、不推送，彻底避免与云端抢同一文件，也不产生未提交改动卡住 git pull。
+        git_sync_before()
+        print("[镜像] 云端为主力，本地仅 git pull 最新观察池，不扫描不推送。")
         return
 
     git_sync_before()  # 拉取云端最新观察池（单次 pull；循环内只在内存累计，结束再统一写回）
