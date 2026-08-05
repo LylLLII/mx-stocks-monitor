@@ -349,7 +349,8 @@ def _git(args):
     try:
         import subprocess
         r = subprocess.run(["git"] + args, cwd=str(WORKSPACE),
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
         if r.returncode != 0:
             msg = (r.stderr or r.stdout).strip().replace("\n", " ")
             print(f"[git] 跳过: {' '.join(args)} -> {msg[:160]}")
@@ -728,7 +729,35 @@ def _report_t1_failures():
         sys.exit(1)
 
 
+def _install_log_tee():
+    """把 stdout/stderr 同时写到控制台（若有）与 monitor.log，保证静默运行时仍可查日志。"""
+    log_path = WORKSPACE / "monitor.log"
+    try:
+        _log_f = log_path.open("a", encoding="utf-8")
+    except Exception:
+        return
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, s):
+            for st in self._streams:
+                try:
+                    st.write(s)
+                except Exception:
+                    pass
+        def flush(self):
+            for st in self._streams:
+                try:
+                    st.flush()
+                except Exception:
+                    pass
+    sys.stdout = _Tee(sys.stdout, _log_f)
+    sys.stderr = _Tee(sys.stderr, _log_f)
+
+
 def main():
+    _install_log_tee()
+    print(f"\n--- run {now_shanghai():%Y-%m-%d %H:%M:%S} ---", flush=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true", help="忽略交易时段守卫")
     ap.add_argument("--loop", action="store_true",
