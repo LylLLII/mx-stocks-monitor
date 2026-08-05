@@ -408,7 +408,7 @@ T1_COLS = [
 # 输出列 = MAPPING 中除「仅内部」字段外的所有列 + 冻结快照 + T1 跟踪
 MASTER_COLS = [m[0] for m in MAPPING if m[0] not in _LIVE_ONLY] + [
     "首次入选日期", "首次入选时间", "入选价(元)", "入选时涨跌幅(%)",
-    "最近入选时间", "入选次数", "入选扫描时间点"
+    "入选次数", "入选扫描时间点"
 ] + T1_COLS
 
 
@@ -593,7 +593,7 @@ def _merge_rows(pool, rows, now):
                 # 冻结首次入选快照：以腾讯实时价（信号出现时）为基准，后续命中不再覆盖；
                 # 腾讯不可达时回退妙想最新价（见 _snapshot_for_new）
                 "入选价(元)": snap_price, "入选时涨跌幅(%)": snap_pct,
-                "最近入选时间": ts, "入选次数": "1", "入选扫描时间点": ts,
+                "入选次数": "1", "入选扫描时间点": ts,
             })
             pool[code] = new
             added.append(code)
@@ -601,7 +601,6 @@ def _merge_rows(pool, rows, now):
             ex = pool[code]
             ex.update(m)
             ex["入选次数"] = str(int(ex.get("入选次数", "0") or 0) + 1)
-            ex["最近入选时间"] = ts
             pts = [p for p in (ex.get("入选扫描时间点") or "").split(";") if p]
             pts.append(ts)
             ex["入选扫描时间点"] = ";".join(pts)
