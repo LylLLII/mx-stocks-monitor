@@ -213,7 +213,7 @@ MAPPING = [
 ]
 T1_COLS = [
     "次日_跟踪状态", "次日_跟踪日期",
-    "次日_开盘涨跌幅", "次日_午间涨跌幅", "次日_收盘涨跌幅",
+    "次日_开盘涨跌幅", "次日_午间涨跌幅", "次日_收盘涨跌幅", "次日_当前涨跌幅",
     "次日_最高涨跌幅", "次日_最低涨跌幅", "次日_形态",
 ]
 MASTER_COLS = [m[0] for m in MAPPING] + [
@@ -661,10 +661,11 @@ def _apply_t1(ex, target, prev, o, h, l, c, m, status):
 T1_FETCH_FAILURES = []
 
 def track_followups(pool, force):
-    """对池中每只股票，在其 T+1 日收盘后记录次日表现；返回是否有变更。
-    - target==today：优先 gtimg 实时+分时；gtimg 失败则 day/query 同源兜底。
-    - target<today（错过窗口）：用 day/query 回溯补抓（最近~5交易日有效），
-      成功标"已补抓"，超窗口/无数据才标"已过期"（仍可后续重试）。
+    """对池中每只股票，在其 T+1 日记录次日表现；返回是否有变更。
+    - 次日_当前涨跌幅：每次运行实时刷新（仅当 T+1==今天，盘中观察用）。
+    - 次日_收盘涨跌幅等收盘字段：仅 T+1 日收盘后(after_close)抓取，标"已跟踪"后冻结；
+      --force 不再提前触发（避免盘中实时价被误存为"收盘"）。
+    - 错过的 T+1：用 day/query 回溯补抓(最近~5交易日)，标"已补抓"；超窗口才标"已过期"。
     取数失败记入 T1_FETCH_FAILURES 并打印 ::error::，使 CI 运行变红可见。"""
     global T1_FETCH_FAILURES
     T1_FETCH_FAILURES = []
@@ -673,8 +674,6 @@ def track_followups(pool, force):
     after_close = now.time() >= datetime.strptime("15:00", "%H:%M").time()
     changed = False
     for code, ex in pool.items():
-        if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓"):
-            continue
         first_s = (ex.get("首次入选日期") or "").strip()
         if not first_s:
             continue
@@ -686,11 +685,22 @@ def track_followups(pool, force):
         target = _next_trading_day(first_d)
         if target > today:
             continue                      # 还没到 T+1
-        if target < today:               # 错过窗口：尝试用 day/query 回溯补抓
+        # 盘中实时：仅 T+1==今天 时刷新"当前涨跌幅"供观察
+        if target == today:
+            live0 = _fetch_live(code, plate)
+            if live0 and live0.get("prev_close"):
+                ex["次日_当前涨跌幅"] = round(
+                    (live0["price"] - live0["prev_close"]) / live0["prev_close"] * 100, 2)
+                changed = True
+        # 已抓过收盘的：不重复抓（上面已刷新当前涨跌幅则跳过，否则也跳过）
+        if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓"):
+            continue
+        if target < today:               # 错过窗口：回溯补抓
             kb = _fetch_day_minutes(code, plate, target)
             if kb and kb.get("prev_close"):
                 shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
                                   kb["high"], kb["low"], kb["close"], kb["mid"], "已补抓")
+                ex["次日_当前涨跌幅"] = ex.get("次日_收盘涨跌幅", "")
                 changed = True
                 print(f"[补抓] {code} T+1 回溯成功: 开{ex['次日_开盘涨跌幅']} 午{ex['次日_午间涨跌幅']} 收{ex['次日_收盘涨跌幅']} 高{ex['次日_最高涨跌幅']} 低{ex['次日_最低涨跌幅']} [{shape}]")
             else:
@@ -700,12 +710,12 @@ def track_followups(pool, force):
                     changed = True
                 print(f"::warning::T+1 回溯失败(超回溯窗口或无数据): {code}")
             continue
-        # target == today：仅收盘后（或 --force）抓取，确保完整 OHLC
-        if not (after_close or force):
+        # target == today：仅收盘后(after_close)抓取收盘字段（--force 不再绕过）
+        if not after_close:
             continue
         live = _fetch_live(code, plate)
-        if not live or not live.get("prev_close"):
-            kb = _fetch_day_minutes(code, plate, target)   # gtimg 失败，同源兜底
+        if not (live and live.get("prev_close")):
+            kb = _fetch_day_minutes(code, plate, target)   # 实时失败，同源兜底
             if kb and kb.get("prev_close"):
                 shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
                                   kb["high"], kb["low"], kb["close"], kb["mid"], "已跟踪")
