@@ -586,11 +586,13 @@ def _merge_rows(pool, rows, now):
     for m in rows:
         code = m["代码"]
         if code not in pool:
+            snap_price, snap_pct = _snapshot_for_new(m)
             new = dict(m)
             new.update({
                 "首次入选日期": date, "首次入选时间": time,
-                # 冻结首次入选快照：以信号出现时的价格/涨幅为基准，后续命中不再覆盖
-                "入选价(元)": m.get("最新价(元)"), "入选时涨跌幅(%)": m.get("涨跌幅(%)"),
+                # 冻结首次入选快照：以腾讯实时价（信号出现时）为基准，后续命中不再覆盖；
+                # 腾讯不可达时回退妙想最新价（见 _snapshot_for_new）
+                "入选价(元)": snap_price, "入选时涨跌幅(%)": snap_pct,
                 "最近入选时间": ts, "入选次数": "1", "入选扫描时间点": ts,
             })
             pool[code] = new
@@ -726,6 +728,26 @@ def _fetch_live(code, plate):
         "high": _num(f[33]),       # 最高
         "low": _num(f[34]),        # 最低
     }
+
+
+def _snapshot_for_new(m):
+    """新股首次入选：优先用腾讯实时价作买入基准（单位可靠、与 T+1/回填同源），
+    腾讯不可达时回退妙想最新价（仅兜底，可能略偏）。返回 (入选价, 入选时涨跌幅%)。"""
+    code = m.get("代码", "")
+    plate = m.get("上市板块", "")
+    live = None
+    try:
+        live = _fetch_live(code, plate)
+    except Exception as e:  # 网络等异常，兜底妙想
+        print(f"[快照] {code} 腾讯取价异常({type(e).__name__})，回退妙想")
+    if live and live.get("price") and live.get("prev_close"):
+        price = live["price"]
+        prev = live["prev_close"]
+        pct = round((price - prev) / prev * 100, 2) if prev else ""
+        return price, pct
+    # 兜底：妙想最新价（可能略偏，但保证有基准）
+    print(f"[快照] {code} 腾讯取价失败，回退妙想最新价")
+    return m.get("最新价(元)"), m.get("涨跌幅(%)")
 
 
 def _fetch_mid_price(code, plate, target):
