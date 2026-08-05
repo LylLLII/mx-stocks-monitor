@@ -22,6 +22,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   monitor:
@@ -56,4 +57,5 @@ jobs:
       - name: Run monitor (loop, ~2min density)
         env:
           EM_API_KEY: ${{ secrets.EM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python screener_monitor.py --loop ${{ github.event.inputs.force == 'true' && '--force' || '' }}

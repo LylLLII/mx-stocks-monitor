@@ -42,6 +42,19 @@ CLIENT_ID = "mx-stocks-screener"
 API_KEY_PAGE_URL = "https://ai.eastmoney.com/mxClaw"
 DEFAULT_EXPIRES_IN = 30 * 24 * 60 * 60
 
+# 自定义异常：用于区分「云端缺密钥」与「key 过期」两类失败，便于上层精准告警
+class MissingSecret(RuntimeError):
+    """云端运行却拿不到 EM_API_KEY（仓库未配置 Secret）。"""
+
+
+class KeyExpired(RuntimeError):
+    """EM_API_KEY 已失效（HTTP 401 或业务码 401）。"""
+
+
+# 本地 --no-push 开关：置 True 时 git_sync_after 只 pull、不 commit/push，
+# 避免本地与云端（唯一写入方）抢同一份 CSV。
+_NO_PUSH = False
+
 
 # ---------------- 自带授权（无需外部技能） ----------------
 def _mx_dir() -> Path:
@@ -168,6 +181,13 @@ def ensure_api_key() -> str:
     """返回可用 key；若无则引导授权并退出，下次运行自动落盘。"""
     if _has_valid_key():
         return _load_api_key()
+    # 云端（无头）环境拿不到本地 key 文件、也没有 EM_API_KEY 环境变量：
+    # 必须显式失败（红色 ✗），绝不能 sys.exit(0) 制造「成功」假象。
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        raise MissingSecret(
+            "云端缺少 EM_API_KEY：请在仓库 Settings → Secrets and variables → Actions "
+            "新建 Secret（Name=EM_API_KEY，Value=本地 ~/.mx-skills/em_api_key 的内容，去掉换行）。"
+        )
     pending = _read_pending()
     if pending is not None:
         try:
@@ -188,6 +208,169 @@ def ensure_api_key() -> str:
     _write_pending(token, auth_url, api_key_url, exp)
     _print_auth(auth_url, api_key_url)
     sys.exit(0)
+
+
+# ---------------- 续期 / 过期告警 ----------------
+def _notify_key_expired():
+    """key 失效时通知：云端开一个去重 Issue；本地打印醒目提示。"""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        _create_expiry_issue()
+    else:
+        print("=" * 56)
+        print("⚠️  EM_API_KEY 已失效！选股已暂停。")
+        print("请在本机运行一次续期（约 30 秒扫码）：")
+        print("    python screener_monitor.py --renew")
+        print("续期后脚本会自动把新 key 推送到仓库 Secret，云端下个周期自动恢复。")
+        print("=" * 56)
+
+
+def _dedupe_issue_title() -> str:
+    return "🔑 EM_API_KEY 已过期 — 请本地运行 --renew 续期"
+
+
+def _create_expiry_issue():
+    """在云端仓库开一个去重的续期提醒 Issue（优先用 gh，回退 REST）。"""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        print("[告警] 无法获取 GITHUB_REPOSITORY，跳过创建续期 Issue")
+        return
+    title = _dedupe_issue_title()
+    body = (
+        "东方财富 API key 已失效（HTTP 401），选股已暂停。\n\n"
+        "请在本机执行：\n"
+        "    python screener_monitor.py --renew\n"
+        "扫码授权后，脚本会自动把新 key 推送到仓库 Secret（EM_API_KEY），"
+        "云端下个触发周期会自动用上新 key，无需其他操作。"
+    )
+    try:
+        import subprocess
+        # 去重：先看是否已有未关闭的同名 Issue
+        r = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--state", "open",
+             "--label", "key-expiry", "--json", "title"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            import json as _j
+            for it in _j.loads(r.stdout or "[]"):
+                if title in (it.get("title") or ""):
+                    print("[告警] 已存在未关闭的续期 Issue，跳过重复创建")
+                    return
+        r2 = subprocess.run(
+            ["gh", "issue", "create", "--repo", repo, "--title", title,
+             "--body", body, "--label", "key-expiry"],
+            capture_output=True, text=True, timeout=30)
+        if r2.returncode == 0:
+            print(f"[告警] 已创建续期 Issue: {r2.stdout.strip()}")
+            return
+        print(f"[告警] gh issue create 失败: {r2.stderr.strip()[:200]}")
+    except Exception as e:
+        print(f"[告警] 创建 Issue 异常: {type(e).__name__}: {e}")
+    # 回退：REST API（需要 GITHUB_TOKEN，Actions 已注入）
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return
+    try:
+        headers = {"Authorization": f"Bearer {token}",
+                   "Accept": "application/vnd.github+json"}
+        rr = httpx.get(
+            f"https://api.github.com/repos/{repo}/issues",
+            params={"state": "open", "labels": "key-expiry", "per_page": 20},
+            headers=headers, timeout=20)
+        if rr.status_code == 200:
+            for it in rr.json():
+                if title in (it.get("title") or ""):
+                    print("[告警] 已存在未关闭的续期 Issue，跳过")
+                    return
+        cr = httpx.post(
+            f"https://api.github.com/repos/{repo}/issues", headers=headers,
+            json={"title": title, "body": body, "labels": ["key-expiry"]}, timeout=20)
+        print(f"[告警] REST 创建 Issue 状态: {cr.status_code}")
+    except Exception as e:
+        print(f"[告警] REST 创建 Issue 异常: {type(e).__name__}: {e}")
+
+
+def _push_secret(api_key: str):
+    """把新 key 推送到仓库 Secret EM_API_KEY（需本地有 gh 且已登录 / 能推断仓库）。"""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        try:
+            import subprocess
+            r = subprocess.run(["git", "config", "--get", "remote.origin.url"],
+                               cwd=str(WORKSPACE), capture_output=True,
+                               text=True, timeout=20)
+            url = (r.stdout or "").strip()
+            m = re.search(r"github\.com[:/]([^/]+/[^/.]+)", url)
+            if m:
+                repo = m.group(1)
+        except Exception:
+            pass
+    if not repo:
+        print("[续期] 未能确定仓库，请手动在仓库 Settings→Secrets 添加 EM_API_KEY。")
+        return
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["gh", "secret", "set", "EM_API_KEY", "--repo", repo, "--body", api_key.strip()],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            print(f"[续期] 已自动推送新 key 到仓库 {repo} 的 Secret EM_API_KEY，"
+                  f"云端下个周期自动恢复。")
+        else:
+            print(f"[续期] 自动推送失败({r.stderr.strip()[:200]})，"
+                  f"请手动在仓库 Settings→Secrets 添加 EM_API_KEY。")
+    except FileNotFoundError:
+        print("[续期] 本机未安装 gh，请手动在仓库 Settings→Secrets 添加 EM_API_KEY"
+              f"（值为新 key，去换行）。")
+    except Exception as e:
+        print(f"[续期] 推送异常: {type(e).__name__}: {e}")
+
+
+def cmd_renew():
+    """本地续期命令：测试当前 key → 失效则打印二维码轮询 → 写入并推送新 key。"""
+    print("=== 续期 EM_API_KEY ===")
+    cur = _load_api_key()
+    if cur:
+        try:
+            asyncio.run(mcp_call(QUERY, "A股", cur))
+            print("[续期] 当前 key 仍有效，无需续期。")
+            return
+        except KeyExpired:
+            print("[续期] 当前 key 已失效，开始续期流程 ...")
+        except Exception as e:
+            print(f"[续期] 当前 key 测试异常({type(e).__name__})，为稳妥起见仍执行续期 ...")
+    # 续期流程：复用 pending（若有未完成授权）或新建 token
+    pending = _read_pending()
+    if pending is None:
+        token, auth_url, api_key_url, exp = _api_create()
+        _write_pending(token, auth_url, api_key_url, exp)
+    else:
+        token = pending["token"]
+        auth_url = pending.get("authUrl")
+        api_key_url = pending.get("apiKeyUrl") or API_KEY_PAGE_URL
+    _print_auth(auth_url, api_key_url)
+    # 轮询授权结果（最多等 10 分钟，给人扫码时间）
+    import time as _t
+    deadline = _t.monotonic() + 600
+    new_key = None
+    while _t.monotonic() < deadline:
+        try:
+            state, api_key = _api_result(token)
+        except Exception as e:
+            print(f"[续期] 查询失败: {e}")
+            _t.sleep(5)
+            continue
+        if state == "done" and api_key:
+            new_key = api_key
+            break
+        print(f"[续期] 等待扫码授权 ... (state={state})")
+        _t.sleep(5)
+    if not new_key:
+        print("[续期] 超时未授权，请扫码后再次运行 --renew。")
+        sys.exit(1)
+    _write_api_key(new_key)
+    _clear_pending()
+    print("[续期] 新 key 已写入本地 ~/.mx-skills/em_api_key")
+    _push_secret(new_key)
 
 
 # ---------------- 选股与累计逻辑 ----------------
@@ -230,8 +413,14 @@ def now_shanghai() -> datetime:
 
 
 def in_trading_hours(dt: datetime) -> bool:
-    if dt.weekday() >= 5:
-        return False
+    # 先判交易日：跳过周末与法定节假日（chinese_calendar 不可用时退化为仅判周末）
+    try:
+        import chinese_calendar as cn
+        if not cn.is_workday(dt.date()):
+            return False
+    except Exception:
+        if dt.weekday() >= 5:
+            return False
     t = dt.time()
     morning = datetime.strptime("09:30", "%H:%M").time() <= t <= datetime.strptime("11:30", "%H:%M").time()
     afternoon = datetime.strptime("13:00", "%H:%M").time() <= t <= datetime.strptime("15:00", "%H:%M").time()
@@ -258,7 +447,7 @@ async def mcp_call(query: str, select_type: str, api_key: str) -> dict:
             },
         )
         if r.status_code == 401:
-            raise RuntimeError("EM_API_KEY 失效 (HTTP 401)，需重新授权")
+            raise KeyExpired("EM_API_KEY 失效 (HTTP 401)，需重新授权")
         try:
             payload = r.json()
         except Exception as e:
@@ -267,7 +456,7 @@ async def mcp_call(query: str, select_type: str, api_key: str) -> dict:
             code = payload.get("code")
             status = payload.get("status")
             if code in (401, "401") or status in (401, "401"):
-                raise RuntimeError("EM_API_KEY 失效 (业务码 401)，需重新授权")
+                raise KeyExpired("EM_API_KEY 失效 (业务码 401)，需重新授权")
             data = payload.get("data") or {}
             if isinstance(data, dict) and data:
                 return data
@@ -370,6 +559,10 @@ def git_sync_before():
 
 
 def git_sync_after():
+    if _NO_PUSH:
+        # 本地镜像模式：绝不 commit/push，避免与云端（唯一写入方）抢同一份 CSV
+        print("[git] --no-push：跳过 commit/push，仅保留本地镜像（数据以云端为准）")
+        return
     _git(["add", str(MASTER_CSV)])
     if _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
         _git(["pull", "--no-edit"])
@@ -748,6 +941,18 @@ def _install_log_tee():
     """把 stdout/stderr 同时写到控制台（若有）与 monitor.log，保证静默运行时仍可查日志。"""
     log_path = WORKSPACE / "monitor.log"
     try:
+        # 日志轮转：超过 5MB 时把旧日志改名为 monitor.log.1（仅保留一份备份）
+        try:
+            if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+                backup = log_path.with_suffix(".log.1")
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                except OSError:
+                    pass
+                log_path.rename(backup)
+        except Exception:
+            pass
         _log_f = log_path.open("a", encoding="utf-8")
     except Exception:
         return
@@ -789,7 +994,18 @@ def main():
                     help="循环间隔秒（默认120）")
     ap.add_argument("--loop-max-seconds", type=int, default=240,
                     help="单次运行最长持续秒（默认240，须<300避免与下次触发重叠）")
+    ap.add_argument("--renew", action="store_true",
+                    help="本地续期 EM_API_KEY（扫码一次，自动推送到仓库 Secret）")
+    ap.add_argument("--no-push", action="store_true",
+                    help="本地镜像模式：只 pull 不 push，避免与云端（唯一写入方）冲突")
     args = ap.parse_args()
+
+    global _NO_PUSH
+    _NO_PUSH = bool(args.no_push)
+
+    if args.renew:
+        cmd_renew()
+        return
 
     git_sync_before()  # 拉取云端最新观察池（单次 pull；循环内只在内存累计，结束再统一写回）
     pool = load_master()
@@ -804,6 +1020,12 @@ def main():
             try:
                 _scan_once(pool, args.force)
                 track_followups(pool, args.force)  # 顺带处理 T+1 跟踪（收盘后抓取）
+            except (MissingSecret, KeyExpired) as e:
+                if isinstance(e, MissingSecret):
+                    print(f"[致命] {e}")
+                else:
+                    _notify_key_expired()
+                sys.exit(1)  # 让本次云端运行变红，明确暴露失败
             except Exception as e:
                 print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次迭代失败，跳过: {type(e).__name__}: {e}")
             iterations += 1
@@ -828,6 +1050,12 @@ def main():
             print(f"[结果] 本次命中 {len(rows)} 只")
             if rows:
                 _merge_rows(pool, rows, now)
+        except MissingSecret as e:
+            print(f"[致命] {e}")
+            sys.exit(1)
+        except KeyExpired:
+            _notify_key_expired()
+            sys.exit(1)
         except Exception as e:
             print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
