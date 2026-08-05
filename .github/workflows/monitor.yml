@@ -1,3 +1,4 @@
+# re-register cron schedule (kick) - 2026-08-05
 name: 妙想选股观察池监控（云端）
 
 concurrency:
