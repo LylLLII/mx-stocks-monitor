@@ -739,6 +739,8 @@ def _install_log_tee():
     class _Tee:
         def __init__(self, *streams):
             self._streams = streams
+            self.encoding = "utf-8"
+            self.errors = "replace"
         def write(self, s):
             for st in self._streams:
                 try:
@@ -751,6 +753,12 @@ def _install_log_tee():
                     st.flush()
                 except Exception:
                     pass
+        def isatty(self):
+            return False
+        def writable(self):
+            return True
+        def readable(self):
+            return False
     sys.stdout = _Tee(sys.stdout, _log_f)
     sys.stderr = _Tee(sys.stderr, _log_f)
 
@@ -782,7 +790,7 @@ def main():
                 _scan_once(pool, args.force)
                 track_followups(pool, args.force)  # 顺带处理 T+1 跟踪（收盘后抓取）
             except Exception as e:
-                print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次迭代失败，跳过: {e}")
+                print(f"[错误] {now_shanghai():%Y-%m-%d %H:%M} 单次迭代失败，跳过: {type(e).__name__}: {e}")
             iterations += 1
             if _time.monotonic() + interval < deadline:
                 _time.sleep(interval)
@@ -806,7 +814,7 @@ def main():
             if rows:
                 _merge_rows(pool, rows, now)
         except Exception as e:
-            print(f"[错误] 扫描失败: {e}")
+            print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
     git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
