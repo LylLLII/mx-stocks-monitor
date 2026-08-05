@@ -348,15 +348,20 @@ def _git(args):
     """best-effort git 调用，失败仅提示，不中断监控。"""
     try:
         import subprocess
+        # Windows 下抑制子进程控制台窗口（避免每 3 分钟弹一次 git.exe 黑窗）
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(["git"] + args, cwd=str(WORKSPACE),
                            capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=60)
+                           errors="replace", timeout=60,
+                           creationflags=creationflags)
         if r.returncode != 0:
             msg = (r.stderr or r.stdout).strip().replace("\n", " ")
             print(f"[git] 跳过: {' '.join(args)} -> {msg[:160]}")
         return r.returncode == 0
     except Exception as e:
-        print(f"[git] 跳过: {e}")
+        print(f"[git] 跳过: {type(e).__name__}: {e}")
         return False
 
 
