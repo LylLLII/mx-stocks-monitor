@@ -533,7 +533,9 @@ def run_screener() -> list:
 def load_master() -> dict:
     pool = {}
     if MASTER_CSV.exists():
-        with MASTER_CSV.open(encoding="utf-8") as f:
+        # 注意：CSV 可能带 UTF-8 BOM（Excel 另存为会加 ef bb bf），
+        # 必须用 utf-8-sig 打开，否则首列名变成 '\ufeff代码' 导致所有行被跳过、观察池被清空。
+        with MASTER_CSV.open(encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 code = (r.get("代码") or "").strip()
                 if code:
