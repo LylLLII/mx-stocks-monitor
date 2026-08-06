@@ -569,14 +569,26 @@ def git_sync_before():
 
 
 def git_sync_after():
+    """推送本次增量到远端。push 失败 → pull --rebase → 重推一次；仍失败则 abort rebase 并留本地。"""
     if _NO_PUSH:
         # 本地镜像模式：绝不 commit/push，避免与云端（唯一写入方）抢同一份 CSV
         print("[git] --no-push：跳过 commit/push，仅保留本地镜像（数据以云端为准）")
-        return
+        return True
     _git(["add", str(MASTER_CSV)])
-    if _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
-        _git(["pull", "--no-edit"])
-        _git(["push"])
+    if not _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
+        # nothing to commit 也算成功
+        return True
+    if _git(["push"]):
+        return True
+    # push 被拒：远端有新的 commit（如云端同期推送）。先 pull --rebase 解冲突，再重推
+    print("[git] push 被拒，尝试 pull --rebase 合并远端增量后重推 ...")
+    if _git(["pull", "--rebase", "--no-edit"]) and _git(["push"]):
+        print("[git] push-rebase-push 成功：本地增量已叠加到远端最新状态之上")
+        return True
+    # rebase 仍冲突 / push 仍失败：abort rebase 保住本地工作区，留待下次运行重试
+    print("[git] rebase+push 持续失败，abort rebase 保住本地增量（本次未推送，不会丢数据）")
+    _git(["rebase", "--abort"])
+    return False
 
 
 def _merge_rows(pool, rows, now):
@@ -593,13 +605,17 @@ def _merge_rows(pool, rows, now):
             new.update({
                 "首次入选日期": date, "首次入选时间": time,
                 # 冻结首次入选快照：以腾讯实时价（信号出现时）为基准，后续命中不再覆盖；
-                # 腾讯不可达时回退妙想最新价（见 _snapshot_for_new）
+                # 腾讯不可达时回退妙想最新价（见 _snapshot_for_new）。
+                # 注意：仅「入选价/入选时涨跌幅/首次入选日期+时间」冻结，
+                # 其余行情字段（量比/换手率/总市值等）每次重复命中都会刷新。
                 "入选价(元)": snap_price, "入选时涨跌幅(%)": snap_pct,
                 "入选次数": "1", "入选扫描时间点": ts,
             })
             pool[code] = new
             added.append(code)
         else:
+            # 重复命中：仅刷新行情快照字段（MAPPING 列出的量比/换手率等），
+            # 不触碰入选时间、入选价、入选次数等冻结字段。
             ex = pool[code]
             ex.update(m)
             ex["入选次数"] = str(int(ex.get("入选次数", "0") or 0) + 1)
@@ -711,7 +727,10 @@ def _next_trading_day(d):
 
 def _fetch_live(code, plate):
     """腾讯实时行情（qt.gtimg.cn）：现价/最高/最低/今开/昨收，单位均为元。
-    返回字段：price 现价, high 最高, low 最低, open 今开, prev_close 昨收。"""
+    返回字段：price 现价, high 最高, low 最低, open 今开, prev_close 昨收,
+             suspended 是否停牌（现价和今同时未变且成交量极低时判定）。
+    停牌判定：现价==昨收==0 较罕见（退市股已被剔除），更常见是现价==昨收（不动）
+    且今开==0；综合判断用「今开==0 且现价==昨收 且成交量<手」。"""
     pre = _tx_prefix(code, plate)
     text = _http_get_text(f"https://qt.gtimg.cn/q={pre}{code}")
     if not text:
@@ -722,12 +741,22 @@ def _fetch_live(code, plate):
     f = m.group(1).split("~")
     if len(f) < 35:
         return None
+    price = _num(f[3])        # 现价
+    prev_close = _num(f[4])   # 昨收（作为 T+1 涨跌幅基准）
+    open_p = _num(f[5])        # 今开
+    high = _num(f[33])         # 最高
+    low = _num(f[34])          # 最低
+    volume = _num(f[6])        # 成交量(手)
+    # 停牌典型特征：今开==0 且现价==昨收（无交易）
+    suspended = (open_p == 0 and price is not None and price == prev_close
+                  and (volume is None or volume == 0))
     return {
-        "price": _num(f[3]),       # 现价
-        "prev_close": _num(f[4]),  # 昨收（作为 T+1 涨跌幅基准）
-        "open": _num(f[5]),        # 今开
-        "high": _num(f[33]),       # 最高
-        "low": _num(f[34]),        # 最低
+        "price": price,
+        "prev_close": prev_close,
+        "open": open_p,
+        "high": high if not suspended else prev_close,  # 停牌时无日内波幅，取昨收
+        "low": low if not suspended else prev_close,
+        "suspended": suspended,
     }
 
 
@@ -935,6 +964,13 @@ def track_followups(pool, force):
             live0 = _fetch_live(code, plate)
             if live0 and live0.get("prev_close"):
                 prev = live0["prev_close"]
+                # 停牌判定：今开==0 且现价不动，标记并跳过当日 T+1 抓取
+                if live0.get("suspended"):
+                    ex["次日_跟踪状态"] = "T+1停牌"
+                    ex["次日_形态"] = "停牌无交易"
+                    print(f"[停牌] {code} T+1 停牌，已标记（入选日 {first_s}，T+1 {target}）")
+                    changed = True
+                    continue
                 price = live0.get("price")
                 o = live0.get("open"); h = live0.get("high"); l = live0.get("low")
 
@@ -957,14 +993,24 @@ def track_followups(pool, force):
                     if m is not None:
                         ex["次日_午间涨跌幅"] = _p(m); changed = True
                 # 跟踪状态：盘中标记"跟踪中"，收盘后改"已跟踪"（不再空白）
-                if (ex.get("次日_跟踪状态") or "") not in ("已跟踪", "已补抓"):
+                if (ex.get("次日_跟踪状态") or "") not in ("已跟踪", "已补抓", "T+1停牌"):
                     ex["次日_跟踪状态"] = "跟踪中"; changed = True
-        # 已抓过收盘的：不重复抓（上面已刷新当前涨跌幅则跳过，否则也跳过）
-        if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓"):
+        # 已抓过收盘 / 已确认停牌的：不重复处理
+        if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓", "T+1停牌"):
             continue
         if target < today:               # 错过窗口：回溯补抓
             kb = _fetch_day_minutes(code, plate, target)
             if kb and kb.get("prev_close"):
+                # 补抓回看也需排除停牌日（分时 OHLC 全部相同 = 无实际成交）
+                is_sus_bk = (kb["open"] == kb["close"] == kb["high"] == kb["low"]
+                             and kb.get("open") is not None)
+                if is_sus_bk:
+                    ex["次日_跟踪状态"] = "T+1停牌"
+                    ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+                    ex["次日_形态"] = "停牌无交易"
+                    print(f"[停牌] {code} T+1 停牌(补抓确认)，已标记")
+                    changed = True
+                    continue
                 shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
                                   kb["high"], kb["low"], kb["close"], kb["mid"], "已补抓")
                 ex["次日_当前涨跌幅"] = ex.get("次日_收盘涨跌幅", "")
@@ -975,15 +1021,33 @@ def track_followups(pool, force):
                     ex["次日_跟踪状态"] = "已过期"
                     ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
                     changed = True
-                print(f"::warning::T+1 回溯失败(超回溯窗口或无数据): {code}")
+                gap_days = (today - target).days
+                hint = "（可能跨长假，day/query 仅保留近 5 个交易日）" if gap_days > 7 else ""
+                print(f"::warning::T+1 回溯失败(超回溯窗口): {code} T+1={target} 距今{gap_days}天{hint}")
             continue
         # target == today：仅收盘后(after_close)抓取收盘字段（--force 不再绕过）
         if not after_close:
             continue
         live = _fetch_live(code, plate)
+        if live and live.get("suspended"):
+            # 停牌日由实时接口确认为停牌，直接标记无需兜底
+            ex["次日_跟踪状态"] = "T+1停牌"
+            ex["次日_形态"] = "停牌无交易"
+            print(f"[停牌] {code} T+1 停牌(收盘后确认)，已标记")
+            changed = True
+            continue
         if not (live and live.get("prev_close")):
             kb = _fetch_day_minutes(code, plate, target)   # 实时失败，同源兜底
             if kb and kb.get("prev_close"):
+                # 兜底成功时检查分时是否停牌（分时无数据或价格无变化）
+                is_sus_bk = (kb["open"] == kb["close"] == kb["high"] == kb["low"]
+                             and kb.get("open") is not None)
+                if is_sus_bk:
+                    ex["次日_跟踪状态"] = "T+1停牌"
+                    ex["次日_形态"] = "停牌无交易"
+                    print(f"[停牌] {code} T+1 停牌(day/query兜底确认)，已标记")
+                    changed = True
+                    continue
                 shape = _apply_t1(ex, target, kb["prev_close"], kb["open"],
                                   kb["high"], kb["low"], kb["close"], kb["mid"], "已跟踪")
                 changed = True
@@ -1116,7 +1180,8 @@ def main():
                 break
         _write_pool(pool)
         print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
-        git_sync_after()  # 统一 commit+push 一次，与云端互不冲突
+        if not git_sync_after():  # 统一 commit+push 一次，与云端互不冲突
+            print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
         _report_t1_failures()
         return
 
@@ -1141,7 +1206,8 @@ def main():
             print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
-    git_sync_after()  # 把本地本次扫描合并回仓库，与云端互为补充
+    if not git_sync_after():  # 把本地本次扫描合并回仓库，与云端互为补充
+        print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
     _report_t1_failures()
 
 
