@@ -964,8 +964,9 @@ def track_followups(pool, force):
             live0 = _fetch_live(code, plate)
             if live0 and live0.get("prev_close"):
                 prev = live0["prev_close"]
-                # 停牌判定：今开==0 且现价不动，标记并跳过当日 T+1 抓取
-                if live0.get("suspended"):
+                # 停牌判定仅在开盘后(>=9:30)有效：盘前(9:30前)无成交会被误判为停牌，
+                # 此时不应标记为停牌，应跳过、等开盘后再识别真实停牌。
+                if live0.get("suspended") and now.time() >= datetime.strptime("09:30", "%H:%M").time():
                     ex["次日_跟踪状态"] = "T+1停牌"
                     ex["次日_形态"] = "停牌无交易"
                     print(f"[停牌] {code} T+1 停牌，已标记（入选日 {first_s}，T+1 {target}）")
@@ -976,16 +977,17 @@ def track_followups(pool, force):
 
                 def _p(v):
                     return round((float(v) - prev) / prev * 100, 2) if v is not None else ""
-                # 当前涨跌幅：每次刷新（实时）
-                if price is not None:
+                # 当前涨跌幅：每次刷新（实时）；仅开盘后(>=9:30)抓取，盘前无真实现价不写
+                if price and price > 0 and now.time() >= datetime.strptime("09:30", "%H:%M").time():
                     ex["次日_当前涨跌幅"] = _p(price); changed = True
-                # 开盘涨跌幅：开盘后即固定，抓一次即可
-                if o is not None and not ex.get("次日_开盘涨跌幅"):
+                # 开盘涨跌幅：开盘后即固定，抓一次即可；仅在开盘后且为有效正值时抓
+                # （盘前 open 可能为 0，避免锁定错误开盘涨跌幅）
+                if o and o > 0 and not ex.get("次日_开盘涨跌幅"):
                     ex["次日_开盘涨跌幅"] = _p(o); changed = True
-                # 最高/最低涨跌幅：日内实时极值，每次刷新
-                if h is not None:
+                # 最高/最低涨跌幅：日内实时极值，每次刷新；仅在有效正值时抓
+                if h and h > 0:
                     ex["次日_最高涨跌幅"] = _p(h); changed = True
-                if l is not None:
+                if l and l > 0:
                     ex["次日_最低涨跌幅"] = _p(l); changed = True
                 # 午间涨跌幅：11:30 之后可得，抓一次即固化
                 if now.time() >= datetime.strptime("11:30", "%H:%M").time() and not ex.get("次日_午间涨跌幅"):
