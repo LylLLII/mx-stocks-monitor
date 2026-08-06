@@ -925,13 +925,40 @@ def track_followups(pool, force):
         target = _next_trading_day(first_d)
         if target > today:
             continue                      # 还没到 T+1
-        # 盘中实时：仅 T+1==今天 时刷新"当前涨跌幅"供观察
+        # T+1==今天：盘中即可得的字段立即抓取，不必等收盘。
+        # 仅「收盘涨跌幅 + 形态」留到收盘后(after_close)固化，避免把盘中实时价误存为"收盘"。
+        # 可盘中获取：当前/开盘/最高/最低(实时极值)、午间(11:30后)、跟踪日期、跟踪状态(跟踪中)。
         if target == today:
+            if not (ex.get("次日_跟踪日期") or ""):
+                ex["次日_跟踪日期"] = target.strftime("%Y-%m-%d")
+                changed = True
             live0 = _fetch_live(code, plate)
             if live0 and live0.get("prev_close"):
-                ex["次日_当前涨跌幅"] = round(
-                    (live0["price"] - live0["prev_close"]) / live0["prev_close"] * 100, 2)
-                changed = True
+                prev = live0["prev_close"]
+                price = live0.get("price")
+                o = live0.get("open"); h = live0.get("high"); l = live0.get("low")
+
+                def _p(v):
+                    return round((float(v) - prev) / prev * 100, 2) if v is not None else ""
+                # 当前涨跌幅：每次刷新（实时）
+                if price is not None:
+                    ex["次日_当前涨跌幅"] = _p(price); changed = True
+                # 开盘涨跌幅：开盘后即固定，抓一次即可
+                if o is not None and not ex.get("次日_开盘涨跌幅"):
+                    ex["次日_开盘涨跌幅"] = _p(o); changed = True
+                # 最高/最低涨跌幅：日内实时极值，每次刷新
+                if h is not None:
+                    ex["次日_最高涨跌幅"] = _p(h); changed = True
+                if l is not None:
+                    ex["次日_最低涨跌幅"] = _p(l); changed = True
+                # 午间涨跌幅：11:30 之后可得，抓一次即固化
+                if now.time() >= datetime.strptime("11:30", "%H:%M").time() and not ex.get("次日_午间涨跌幅"):
+                    m = _fetch_mid_price(code, plate, target)
+                    if m is not None:
+                        ex["次日_午间涨跌幅"] = _p(m); changed = True
+                # 跟踪状态：盘中标记"跟踪中"，收盘后改"已跟踪"（不再空白）
+                if (ex.get("次日_跟踪状态") or "") not in ("已跟踪", "已补抓"):
+                    ex["次日_跟踪状态"] = "跟踪中"; changed = True
         # 已抓过收盘的：不重复抓（上面已刷新当前涨跌幅则跳过，否则也跳过）
         if (ex.get("次日_跟踪状态") or "") in ("已跟踪", "已补抓"):
             continue
