@@ -1,0 +1,7 @@
+#!/bin/sh
+# mx-stocks-monitor pre-commit 守卫
+# 安装：cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# 作用：提交前自动跑 tools/quality_gate.py，BOM/语法/反模式等问题会被拦截。
+set -e
+ROOT="$(git rev-parse --show-toplevel)"
+exec python3 "$ROOT/tools/quality_gate.py"

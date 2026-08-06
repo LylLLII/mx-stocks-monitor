@@ -1,0 +1,19 @@
+name: 代码质量守卫
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 运行代码质量守卫
+        run: python tools/quality_gate.py

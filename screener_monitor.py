@@ -627,6 +627,19 @@ def _merge_rows(pool, rows, now):
 
 
 def _write_pool(pool):
+    # 防御性写盘：内存池为空但磁盘已有数据 → 拒绝清空，避免 BOM/解析失败把观察池抹掉
+    if not pool:
+        existing_rows = 0
+        if MASTER_CSV.exists():
+            try:
+                with MASTER_CSV.open(encoding="utf-8-sig") as _f:
+                    existing_rows = sum(1 for _ in csv.DictReader(_f))
+            except Exception:
+                existing_rows = 0
+        if existing_rows > 0:
+            print(f"[严重][拒绝写盘] 内存观察池为空，但磁盘 {MASTER_CSV.name} 现有 {existing_rows} 只。"
+                  f"疑似 CSV 解析失败(BOM/编码)，已跳过写盘以防数据清空。请检查文件后重试。")
+            return
     MASTER_CSV.parent.mkdir(parents=True, exist_ok=True)
     with MASTER_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=MASTER_COLS, extrasaction="ignore")
