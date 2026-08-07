@@ -754,7 +754,9 @@ def _write_pool(pool):
         if MASTER_CSV.exists():
             try:
                 with MASTER_CSV.open(encoding="utf-8-sig") as _f:
-                    existing_rows = sum(1 for _ in csv.DictReader(_f))
+                    # 跳过空行（日期分隔行）：只统计真实数据行
+                    existing_rows = sum(1 for _r in csv.DictReader(_f)
+                                        if (_r.get("代码") or "").strip())
             except Exception:
                 existing_rows = 0
         if existing_rows > 0:
@@ -775,11 +777,18 @@ def _write_pool(pool):
         w.writeheader()
         # 按「首次入选日期 + 首次入选时间」排序：不同日期批次按日期分组，
         # 同日内按首次入选时间（早的在前）；时间相同再按代码保证稳定顺序。
+        # 日期切换时写一个空行作分隔（csv.DictReader 会把空行解析为空 dict，
+        # load_master 的 `if not code: continue` 自动跳过，不影响解析与统计）。
+        prev_date = None
         for r in sorted(pool.values(),
                         key=lambda x: (x.get("首次入选日期") or "",
                                        x.get("首次入选时间") or "",
                                        x.get("代码") or "")):
+            d = (r.get("首次入选日期") or "")
+            if prev_date is not None and d != prev_date:
+                f.write("\n")  # 日期分隔空行（DictWriter 不能写空行，直接写文件对象）
             w.writerow(r)
+            prev_date = d
 
 
 def _scan_once(pool, force):

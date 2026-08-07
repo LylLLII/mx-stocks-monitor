@@ -96,7 +96,8 @@ def check_master_parseable():
         with open(MASTER_CSV, encoding="utf-8-sig") as f:
             r = csv.DictReader(f)
             first = list(r.fieldnames or [])
-            n = sum(1 for _ in r)
+            # 跳过空行（观察池的日期分隔行会被 DictReader 解析为空 dict）
+            n = sum(1 for row in r if (row.get("代码") or "").strip())
         if not first or first[0] != "代码":
             err(f"主 CSV 首列应为「代码」，实际为 {first[:1]}")
         else:
