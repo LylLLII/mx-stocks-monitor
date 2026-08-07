@@ -693,11 +693,25 @@ def git_sync_before() -> bool:
     return _git(["pull", "--rebase", "--no-edit"])
 
 
+def _has_data_changes():
+    """CSV 相对 HEAD 是否有实际内容变化（内容比较，文件时间戳不算）。
+
+    修复「收盘后空转刷屏」：render_html 每次运行都会写入当前时间戳，
+    导致 HTML 永远变化、每 3 分钟 commit/push 一次。只有 CSV 数据真正
+    变化（新增/更新/T+1 字段变更）才值得渲染与提交。
+    """
+    return not _git(["diff", "--quiet", "HEAD", "--", str(MASTER_CSV)])
+
+
 def git_sync_after():
     """推送本次增量到远端。push 失败 → pull --rebase → 重推一次；仍失败则 abort rebase 并留本地。"""
     if _NO_PUSH:
         # 本地镜像模式：绝不 commit/push，避免与云端（唯一写入方）抢同一份 CSV
         print("[git] --no-push：跳过 commit/push，仅保留本地镜像（数据以云端为准）")
+        return True
+    if not _has_data_changes():
+        # CSV 无实际变化（收盘后 T+1 已全部跟踪完、无新入选）→ 不提交不推送
+        print("[git] 观察池数据无变化，跳过 commit/push（仅 HTML 时间戳更新不构成提交理由）")
         return True
     _git(["add", str(MASTER_CSV)])
     if MASTER_HTML.exists():
@@ -1456,7 +1470,11 @@ def main():
             else:
                 break
         _write_pool(pool)
-        render_html(pool)
+        if _has_data_changes() or args.force:
+            render_html(pool)
+        else:
+            # 收盘后空转：CSV 无实际变化 → 不重渲染 HTML（时间戳不动），工作区干净
+            print("[跳过] CSV 数据无变化，HTML 保持原样（避免空转刷屏）")
         print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
         if not git_sync_after():  # 统一 commit+push 一次，与云端互不冲突
             print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
@@ -1483,7 +1501,11 @@ def main():
         except Exception as e:
             print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
-    render_html(pool)
+    if _has_data_changes() or args.force:
+        render_html(pool)
+    else:
+        # 收盘后空转：CSV 无实际变化 → 不重渲染 HTML（时间戳不动），工作区干净
+        print("[跳过] CSV 数据无变化，HTML 保持原样（避免空转刷屏）")
     print(f"[累计] 观察池共 {len(pool)} 只")
     if not git_sync_after():  # 把本地本次扫描合并回仓库，与云端互为补充
         print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
