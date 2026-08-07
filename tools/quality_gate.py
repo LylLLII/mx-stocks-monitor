@@ -21,6 +21,12 @@ import py_compile
 import re
 import sys
 
+# Windows 默认控制台编码为 GBK，直接 print ✅/❌ 会抛 UnicodeEncodeError 导致守卫自身崩溃；
+# 强制 stdout/stderr 用 UTF-8（不可编码字符降级替换），保证本地与 CI 都能稳定输出。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASTER_CSV = os.path.join(ROOT, "mx_stocks_screener", "观察池_累计.csv")
 SCREENER = os.path.join(ROOT, "screener_monitor.py")

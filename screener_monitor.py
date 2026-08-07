@@ -555,7 +555,8 @@ def _secid(code: str) -> str:
 
 def _fetch_fundamental(code: str):
     """拉取最新 5 期财务，返回 (ttm_netprofit, debt_ratio, report_date)；失败返回 None。"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    # 缓存日界统一用北京时间（与全局口径一致），避免 UTC runner 上日界错位 8 小时
+    today = now_shanghai().strftime("%Y-%m-%d")
     cached = _FUND_CACHE.get(code)
     if cached and cached[0] == today:
         return cached[1], cached[2], cached[3]
