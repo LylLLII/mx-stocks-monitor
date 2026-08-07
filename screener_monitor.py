@@ -773,10 +773,12 @@ def _write_pool(pool):
     with MASTER_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=MASTER_COLS, extrasaction="ignore")
         w.writeheader()
-        # 按「首次入选日期 + 代码」排序：不同日期的入选批次按日期分组排列，
-        # 同票跨日期批次（如 8-05 与 8-07）分属各自日期组，不在文件中相邻。
+        # 按「首次入选日期 + 首次入选时间」排序：不同日期批次按日期分组，
+        # 同日内按首次入选时间（早的在前）；时间相同再按代码保证稳定顺序。
         for r in sorted(pool.values(),
-                        key=lambda x: (x.get("首次入选日期") or "", x.get("代码") or "")):
+                        key=lambda x: (x.get("首次入选日期") or "",
+                                       x.get("首次入选时间") or "",
+                                       x.get("代码") or "")):
             w.writerow(r)
 
 
