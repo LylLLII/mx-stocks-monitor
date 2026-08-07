@@ -538,8 +538,15 @@ def load_master() -> dict:
         with MASTER_CSV.open(encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 code = (r.get("代码") or "").strip()
-                if code:
-                    pool[code] = r
+                if not code:
+                    continue
+                # 防 git 冲突标记固化：pull/merge 冲突残留的 <<<<<<< HEAD / ======= / >>>>>>> 行
+                # 会被 DictReader 解析成"代码"字段，若不拦截会被 _write_pool 原样写回并 commit 入库。
+                if code.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+                    print(f"[严重] 检测到 git 冲突标记行，已跳过（{code[:30]}...）。"
+                          f"工作区可能残留未解决的合并冲突，请检查。")
+                    continue
+                pool[code] = r
     return pool
 
 
@@ -564,8 +571,11 @@ def _git(args):
         return False
 
 
-def git_sync_before():
-    _git(["pull", "--no-edit"])
+def git_sync_before() -> bool:
+    """拉取远端最新观察池。失败返回 False——调用方必须跳过本轮（不扫描、不写盘），
+    否则会基于旧数据扫描，且 pull 冲突残留的标记可能被 load_master 读入并固化。
+    用 pull --rebase（而非 merge）与 git_sync_after 保持同一套冲突处理语义。"""
+    return _git(["pull", "--rebase", "--no-edit"])
 
 
 def git_sync_after():
@@ -639,6 +649,14 @@ def _write_pool(pool):
         if existing_rows > 0:
             print(f"[严重][拒绝写盘] 内存观察池为空，但磁盘 {MASTER_CSV.name} 现有 {existing_rows} 只。"
                   f"疑似 CSV 解析失败(BOM/编码)，已跳过写盘以防数据清空。请检查文件后重试。")
+            return
+    # 防冲突标记固化（双保险，与 load_master 的过滤配合）：pool 中任何"代码"字段
+    # 以 git 冲突标记开头 → 判定为脏数据，拒绝写盘，防止把 <<<<<<< HEAD 等行 commit 入库。
+    for _r in pool.values():
+        _c = (_r.get("代码") or "").strip()
+        if _c.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+            print(f"[严重][拒绝写盘] 观察池含 git 冲突标记行（{_c[:30]}...），"
+                  f"疑似脏数据，已跳过写盘。请先 git reset/解决冲突后重试。")
             return
     MASTER_CSV.parent.mkdir(parents=True, exist_ok=True)
     with MASTER_CSV.open("w", newline="", encoding="utf-8") as f:
@@ -1163,11 +1181,17 @@ def main():
     if args.no_push:
         # 云端为主力写入时的本地镜像模式：只拉取最新 CSV 供离线查看，
         # 不扫描、不写盘、不推送，彻底避免与云端抢同一文件，也不产生未提交改动卡住 git pull。
-        git_sync_before()
-        print("[镜像] 云端为主力，本地仅 git pull 最新观察池，不扫描不推送。")
+        if not git_sync_before():
+            print("[跳过] git pull 失败（代理/网络？），本轮镜像同步跳过，下次重试")
+        else:
+            print("[镜像] 云端为主力，本地仅 git pull 最新观察池，不扫描不推送。")
         return
 
-    git_sync_before()  # 拉取云端最新观察池（单次 pull；循环内只在内存累计，结束再统一写回）
+    if not git_sync_before():
+        # 拉取失败直接中止本轮：不 load_master、不扫描、不写盘。
+        # 防止「基于旧数据扫描 → _write_pool 把 pull 冲突残留的标记行固化进 CSV」这类污染。
+        print("[跳过] git pull 失败，本轮不执行（避免基于旧数据写盘污染观察池），下次运行自动重试")
+        return
     pool = load_master()
 
     if args.loop:
