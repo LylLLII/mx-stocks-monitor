@@ -856,7 +856,7 @@ def render_xlsx(pool):
                 hc = ws.cell(row=row_idx(), column=c)
                 hc.font = Font(bold=True)
             prev_date = d
-        write_row([(r.get(c) or "").strip() for c in XLSX_COLS])
+        write_row([str(r.get(c) or "").strip() for c in XLSX_COLS])
 
     # 列宽按内容自适应（上限 42，避免「入选扫描时间点」这类长字段撑爆）
     for c in range(1, n + 1):
