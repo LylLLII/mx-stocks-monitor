@@ -836,6 +836,25 @@ def _esc(v):
     return s
 
 
+def _quote_link(code, name):
+    """按代码前缀判断交易所，生成东方财富个股行情页链接。
+
+    规则：6/9 开头 → 沪市(sh)；0/2/3 开头 → 深市(sz)。返回 (href, text)；
+    无法判断（空/异常代码）时返回 (None, 原样文本)，由调用方降级为纯文本。
+    """
+    code = (code or "").strip()
+    name = (name or "").strip()
+    if not code or not code.isdigit():
+        return None, name
+    if code[0] in ("6", "9"):
+        pre = "sh"
+    elif code[0] in ("0", "2", "3"):
+        pre = "sz"
+    else:
+        return None, name
+    return f"https://quote.eastmoney.com/{pre}{code}.html", (name or code)
+
+
 def render_html(pool):
     """把内存池渲染成按日期分组的自包含 HTML 表格，写盘到 MASTER_HTML。
 
@@ -863,8 +882,18 @@ def render_html(pool):
             )
             body_rows.append(f"<tr class=\"head-row\">{header_cells}</tr>")
             prev_date = d
-        cells = "".join(f"<td>{_esc(r.get(c) or '')}</td>" for c in HTML_COLS)
-        body_rows.append(f"<tr>{cells}</tr>")
+        cells = []
+        for c in HTML_COLS:
+            raw = r.get(c) or ""
+            if c == "名称":
+                href, text = _quote_link(r.get("代码"), raw)
+                cells.append(
+                    f'<td><a href="{href}" target="_blank" rel="noopener">{_esc(text)}</a></td>'
+                    if href else f"<td>{_esc(text)}</td>"
+                )
+            else:
+                cells.append(f"<td>{_esc(raw)}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -883,6 +912,8 @@ def render_html(pool):
   .date-row td {{ background: #fff8e6; font-weight: 700; font-size: 14px;
                   color: #9a6700; }}
   tr:nth-child(even) {{ background: #fafbfc; }}
+  td a {{ color: #0969da; text-decoration: none; }}
+  td a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
