@@ -644,7 +644,9 @@ def load_master() -> dict:
                 code = (r.get("代码") or "").strip()
                 if not code:
                     continue
-                # 跳过日期分隔标记行（#===== 2026-08-05 =====）：正常格式，静默跳过
+                # 防御：跳过历史遗留的日期分隔标记行（#===== 2026-08-05 =====）。
+                # 当前 CSV 已不再写此类行（会破坏列一致性、导致 GitHub 表格视图消失），
+                # 此处仅兼容旧文件，新数据不会触发。
                 if code.startswith("#"):
                     continue
                 # 防 git 冲突标记固化：pull/merge 冲突残留的 <<<<<<< HEAD / ======= / >>>>>>> 行
@@ -694,6 +696,8 @@ def git_sync_after():
         print("[git] --no-push：跳过 commit/push，仅保留本地镜像（数据以云端为准）")
         return True
     _git(["add", str(MASTER_CSV)])
+    if MASTER_MD.exists():
+        _git(["add", str(MASTER_MD)])
     if not _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
         # nothing to commit 也算成功
         return True
@@ -781,20 +785,57 @@ def _write_pool(pool):
         w.writeheader()
         # 按「首次入选日期 + 首次入选时间」排序：不同日期批次按日期分组，
         # 同日内按首次入选时间（早的在前）；时间相同再按代码保证稳定顺序。
-        # 日期切换时写一个空行作分隔（csv.DictReader 会把空行解析为空 dict，
-        # load_master 的 `if not code: continue` 自动跳过，不影响解析与统计）。
-        prev_date = None
+        # 注意：CSV 内不再写分隔行——任何非 28 列的行都会让 GitHub 拒绝按表格渲染
+        # （Table tab 消失、退化成纯文本）。日期分组改由同目录的 .md 副本按天呈现。
         for r in sorted(pool.values(),
                         key=lambda x: (x.get("首次入选日期") or "",
                                        x.get("首次入选时间") or "",
                                        x.get("代码") or "")):
-            d = (r.get("首次入选日期") or "")
-            if prev_date is not None and d != prev_date:
-                # 日期分隔标记行：GitHub 网页 CSV 预览会吞掉空行，改用可见的 # 标记行。
-                # csv.DictReader 把它解析为「代码」字段=#=====...，由 load_master 跳过。
-                f.write(f"#===== {d} =====\n")
             w.writerow(r)
+
+
+# ---------------- Markdown 副本（GitHub 网页友好） ----------------
+# CSV 在 GitHub 上只要行数不一致就会退化成纯文本（Table tab 消失）。
+# 为兼顾「Excel 打开 CSV 按列对齐」与「GitHub 网页按天分组 + 列对齐」，
+# 额外生成一份 .md：按「首次入选日期」分组，每天一个二级标题 + 表格，
+# 列对齐由 Markdown 渲染保证，与 CSV 列数无关。
+MASTER_MD = OUTPUT_DIR / "观察池_累计.md"
+
+# .md 里展示的列（与 CSV 一致，全部保留；GitHub 表格列宽自适应）
+MD_COLS = MASTER_COLS
+
+
+def render_markdown(pool):
+    """把内存池渲染成按日期分组的 Markdown 表格，写盘到 MASTER_MD。"""
+    if not pool:
+        return
+    rows = sorted(pool.values(),
+                  key=lambda x: (x.get("首次入选日期") or "",
+                                 x.get("首次入选时间") or "",
+                                 x.get("代码") or ""))
+    MASTER_MD.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# 盘中累计观察池（自动生成，最新更新 {now_shanghai():%Y-%m-%d %H:%M}）",
+        "",
+        "> 本文件由 `screener_monitor.py` 自动生成，请勿手动编辑。",
+        "> 数据同时以 CSV 形式保存在同目录 `观察池_累计.csv`（Excel 打开按列对齐）。",
+        "",
+    ]
+    prev_date = None
+    for r in rows:
+        d = (r.get("首次入选日期") or "").strip() or "未知日期"
+        if d != prev_date:
+            # 每天一个分组标题 + 表头
+            lines.append(f"## 📅 {d}")
+            lines.append("")
+            lines.append("| " + " | ".join(MD_COLS) + " |")
+            lines.append("| " + " | ".join(["---"] * len(MD_COLS)) + " |")
             prev_date = d
+        cells = [(r.get(c) or "").replace("|", "\\|").replace("\n", " ").strip()
+                 for c in MD_COLS]
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+    MASTER_MD.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _scan_once(pool, force):
@@ -1356,6 +1397,7 @@ def main():
             else:
                 break
         _write_pool(pool)
+        render_markdown(pool)
         print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
         if not git_sync_after():  # 统一 commit+push 一次，与云端互不冲突
             print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
@@ -1382,6 +1424,7 @@ def main():
         except Exception as e:
             print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
+    render_markdown(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
     if not git_sync_after():  # 把本地本次扫描合并回仓库，与云端互为补充
         print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
