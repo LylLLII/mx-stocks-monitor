@@ -17,3 +17,8 @@ monitor.log
 
 # 仅保留观察池（跨机同步的核心数据）
 !mx_stocks_screener/观察池_累计.csv
+
+# 敏感凭据防御（防止 token/密钥误入库）
+.env
+*.env
+!*.env.example
