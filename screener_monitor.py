@@ -377,6 +377,7 @@ def cmd_renew():
 QUERY = (
     "A股，剔除北交所、科创板、创业板，剔除ST股和退市股，剔除有新规风险的股票，"
     "剔除近三个月有减持计划的股票，剔除未来三个月有解禁的股票，剔除近三个月收到监管函或监管工作函的股票，"
+    "剔除最新报告期净利润为负的股票，剔除资产负债率超过70%的股票，"
     "涨跌幅在3%到5%之间，量比大于1.5，换手率在5%到10%之间，总市值在50亿到200亿之间，近20日有涨停"
 )
 
@@ -530,6 +531,109 @@ def run_screener() -> list:
     return out
 
 
+# ---------------- 基本面二次校验（排雷，不依赖妙想"自觉"） ----------------
+# 妙想 QUERY 里写了"剔除亏损/高负债"，但 AI 接口未必严格执行、且结果不可审计。
+# 这里在代码层对候选做硬校验：TTM 归母净利润 < 0 或 资产负债率 > 70% 直接拦截。
+# 数据源：东财 F10 主财务指标（datacenter.eastmoney.com，无鉴权、字段稳定）。
+# 口径：净利润用 TTM（拉 5 期滚动计算；算不出时降级最新一期累计）；
+#       负债率用最新报告期（ZCFZL 字段，直接给 %）。
+# 失败策略：接口异常 → 放行（best-effort，避免误杀，保持监控连续性），打日志。
+
+_FUND_MAX_DEBT_RATIO = 70.0      # 资产负债率阈值 %
+_FUND_CACHE = {}                 # code -> (日期, ttm净利, 负债率, 报告期)
+
+
+def _secid(code: str) -> str:
+    """6 开头→SH，其余→SZ（本项目 QUERY 已剔除科创板/创业板/北交所）。"""
+    code = (code or "").strip()
+    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+
+
+def _fetch_fundamental(code: str):
+    """拉取最新 5 期财务，返回 (ttm_netprofit, debt_ratio, report_date)；失败返回 None。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    cached = _FUND_CACHE.get(code)
+    if cached and cached[0] == today:
+        return cached[1], cached[2], cached[3]
+    secid = _secid(code)
+    url = ("https://datacenter.eastmoney.com/securities/api/data/v1/get"
+           "?reportName=RPT_F10_FINANCE_MAINFINADATA"
+           "&columns=SECUCODE,REPORT_DATE,PARENTNETPROFIT,ZCFZL"
+           f"&filter=(SECUCODE%3D%22{secid}%22)"
+           "&pageNumber=1&pageSize=5&sortTypes=-1&sortColumns=REPORT_DATE")
+    try:
+        r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        rows = ((r.json().get("result") or {}).get("data")) or []
+    except Exception as e:
+        print(f"[基本面] {code} 数据获取失败({type(e).__name__})，放行")
+        return None
+    if not rows:
+        print(f"[基本面] {code} 无财务数据，放行")
+        return None
+
+    # 解析各期 (year, month, 净利, 负债率)
+    periods = []
+    for row in rows:
+        rd = (row.get("REPORT_DATE") or "")[:10]
+        try:
+            year, month = int(rd[:4]), int(rd[5:7])
+        except (ValueError, TypeError):
+            continue
+        np_ = row.get("PARENTNETPROFIT")
+        debt = row.get("ZCFZL")
+        if np_ is None:
+            continue
+        periods.append((year, month, float(np_), float(debt) if debt is not None else None))
+
+    if not periods:
+        print(f"[基本面] {code} 财务数据不可解析，放行")
+        return None
+    periods.sort(key=lambda x: (x[0], x[1]))  # 时间升序
+
+    p0 = periods[-1]                     # 最新一期
+    y0, m0, np0, debt0 = p0
+    # TTM：最新期累计 + 最近年报 - 去年同期累计；若最新期即年报或期数不足 → 降级最新一期
+    ttm = np0
+    if m0 != 12:
+        annual = next((p for p in reversed(periods)
+                       if p[1] == 12 and (p[0], p[1]) < (y0, m0)), None)
+        same_last = next((p for p in periods if p[1] == m0 and p[0] < y0), None)
+        if annual and same_last:
+            ttm = np0 + annual[2] - same_last[2]
+    _FUND_CACHE[code] = (today, ttm, debt0, f"{y0}-{m0:02d}")
+    return ttm, debt0, f"{y0}-{m0:02d}"
+
+
+def _fundamental_gate(rows):
+    """对候选 rows（list[dict]，含"代码"列）做基本面硬校验，返回过滤后的列表。"""
+    if not rows:
+        return rows
+    kept, blocked = [], []
+    for m in rows:
+        code = (m.get("代码") or "").strip()
+        if not code:
+            kept.append(m)
+            continue
+        fd = _fetch_fundamental(code)
+        if fd is None:
+            kept.append(m)  # 数据拿不到 → 放行
+            continue
+        ttm, debt, rep = fd
+        reasons = []
+        if ttm is not None and ttm < 0:
+            reasons.append(f"TTM净利润 {ttm/1e4:.0f} 万")
+        if debt is not None and debt > _FUND_MAX_DEBT_RATIO:
+            reasons.append(f"负债率 {debt:.1f}%")
+        if reasons:
+            blocked.append((code, m.get("名称"), "; ".join(reasons), rep))
+            print(f"[基本面][拦截] {code} {m.get('名称')}（{rep}）：{'；'.join(reasons)}")
+        else:
+            kept.append(m)
+    if blocked:
+        print(f"[基本面] 拦截 {len(blocked)} 只: {[b[0] for b in blocked]} | 放行 {len(kept)} 只")
+    return kept
+
+
 def load_master() -> dict:
     pool = {}
     if MASTER_CSV.exists():
@@ -676,6 +780,11 @@ def _scan_once(pool, force):
     rows = run_screener()
     print(f"[结果] 本次命中 {len(rows)} 只")
     if not rows:
+        return False
+    # 基本面二次校验：TTM 净利<0 / 负债率>70% 硬拦截（不依赖妙想 prompt 自觉）
+    rows = _fundamental_gate(rows)
+    if not rows:
+        print("[基本面] 候选全部被拦截，本轮无新增")
         return False
     added, updated = _merge_rows(pool, rows, now)
     print(f"[累计] 本次新增 {len(added)}: {added} | 刷新 {len(updated)}: {updated}")
