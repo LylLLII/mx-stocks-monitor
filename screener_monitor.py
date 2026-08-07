@@ -244,11 +244,15 @@ def _create_expiry_issue():
     )
     try:
         import subprocess
+        # Windows 下抑制子进程控制台窗口（gh.exe 弹窗同样烦人）
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
         # 去重：先看是否已有未关闭的同名 Issue
         r = subprocess.run(
             ["gh", "issue", "list", "--repo", repo, "--state", "open",
              "--label", "key-expiry", "--json", "title"],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30, creationflags=creationflags)
         if r.returncode == 0:
             import json as _j
             for it in _j.loads(r.stdout or "[]"):
@@ -258,7 +262,7 @@ def _create_expiry_issue():
         r2 = subprocess.run(
             ["gh", "issue", "create", "--repo", repo, "--title", title,
              "--body", body, "--label", "key-expiry"],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30, creationflags=creationflags)
         if r2.returncode == 0:
             print(f"[告警] 已创建续期 Issue: {r2.stdout.strip()}")
             return
@@ -1352,7 +1356,9 @@ def _install_log_tee():
         return
     class _Tee:
         def __init__(self, *streams):
-            self._streams = streams
+            # 静默环境（pythonw / 计划任务）下 sys.stdout/stderr 可能为 None，
+            # 过滤掉，保证 tee 只写日志文件也能正常工作。
+            self._streams = [s for s in streams if s is not None]
             self.encoding = "utf-8"
             self.errors = "replace"
         def write(self, s):
