@@ -905,7 +905,7 @@ def _num(v):
         return None
 
 
-def _http_get_json(url, params=None, timeout=15.0, retries=3):
+def _http_get_json(url, params=None, timeout=6.0, retries=2):
     import time as _t
     last = None
     for attempt in range(retries):
@@ -922,7 +922,7 @@ def _http_get_json(url, params=None, timeout=15.0, retries=3):
     return None
 
 
-def _http_get_text(url, timeout=15.0, retries=3):
+def _http_get_text(url, timeout=6.0, retries=2):
     """腾讯 qt.gtimg.cn 返回纯文本（v_xxx="1~..."），需按文本解析。"""
     import time as _t
     last = None
@@ -1183,7 +1183,18 @@ def track_followups(pool, force):
     today = now.date()
     after_close = now.time() >= datetime.strptime("15:00", "%H:%M").time()
     changed = False
+    # 总时长预算：海外 runner 访问腾讯接口可能很慢，20+ 只股票逐只抓取
+    # 若不加总预算，单次 track_followups 可拖 10+ 分钟（15s×3重试×20只=900s），
+    # 超过 loop 的 deadline 保护，导致云端运行超长/卡死。预算内尽力抓，超时下轮再补。
+    import time as _t
+    budget = _t.monotonic() + float(os.environ.get("T1_FETCH_BUDGET", "75"))
+    total = len(pool)
+    processed = 0
     for key, ex in pool.items():
+        processed += 1
+        if _t.monotonic() > budget:
+            print(f"[跟踪] 已达本轮 T+1 抓取预算，剩余 {total - processed + 1} 只留待下轮补抓")
+            break
         # key 为「代码|入选日期」复合键；取数/打印一律用行内的真实代码
         code = ex.get("代码") or (key.split("|")[0] if key else "")
         first_s = (ex.get("首次入选日期") or "").strip()
