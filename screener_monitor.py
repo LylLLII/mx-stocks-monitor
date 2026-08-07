@@ -700,8 +700,8 @@ def git_sync_after():
         print("[git] --no-push：跳过 commit/push，仅保留本地镜像（数据以云端为准）")
         return True
     _git(["add", str(MASTER_CSV)])
-    if MASTER_XLSX.exists():
-        _git(["add", str(MASTER_XLSX)])
+    if MASTER_HTML.exists():
+        _git(["add", str(MASTER_HTML)])
     if not _git(["commit", "-m", f"local: 更新观察池 {now_shanghai():%Y-%m-%d %H:%M}"]):
         # nothing to commit 也算成功
         return True
@@ -803,21 +803,30 @@ def _write_pool(pool):
 # 为兼顾「Excel 打开 CSV 按列对齐」与「GitHub 网页按天分组 + 列对齐」，
 # 额外生成一份 .md：按「首次入选日期」分组，每天一个二级标题 + 表格，
 # 列对齐由 Markdown 渲染保证，与 CSV 列数无关。
-MASTER_XLSX = OUTPUT_DIR / "观察池_累计.xlsx"
+MASTER_HTML = OUTPUT_DIR / "观察池_累计.html"
 
-# xlsx 表格的列：与 CSV 完全一致（全部保留）。
-# 日期分组用「单独整行」呈现（合并单元格 + 加粗，不涂色，简洁），
-# 列本身与 CSV 相同，Excel / GitHub 网页打开的 xlsx 与 csv 内容一一对应。
-XLSX_COLS = MASTER_COLS
+# HTML 表格的列：与 CSV 完全一致（全部保留）。
+# 日期分组用「单独整行」呈现（跨列 + 加粗 + 浅色底），
+# 列本身与 CSV 相同，GitHub 网页点开即渲染，与 csv 内容一一对应。
+HTML_COLS = MASTER_COLS
 
 
-def render_xlsx(pool):
-    """把内存池渲染成按日期分组的 Excel 文件，写盘到 MASTER_XLSX。
+def _esc(v):
+    """HTML 转义 + 超长单元格截断，防注入/防表格爆炸。"""
+    import html as _html
+    s = str(v or "")
+    s = _html.escape(s)
+    if len(s) > 60:
+        s = s[:60] + "…"
+    return s
 
-    GitHub 网页原生支持 .xlsx 在线预览（无需下载，点开即渲染成表格），
-    不像 markdown 表格那样受「列头竖排」窄屏优化影响，也不受 sanitize 限制，
-    是所有格式里在 GitHub 上观感最接近本机 Excel 的方案。
-    日期分组用单独整行呈现：跨列合并 + 加粗，不加背景色（简洁不花哨）。
+
+def render_html(pool):
+    """把内存池渲染成按日期分组的自包含 HTML 表格，写盘到 MASTER_HTML。
+
+    GitHub 网页对 .html 文件会完整渲染（含内联 CSS），不受 markdown 表格
+    的「列头竖排」限制，也不像 .xlsx 那样完全无法预览。
+    日期分组用单独整行：跨全列 + 加粗 + 浅色背景，一眼分清哪天是哪天。
     """
     if not pool:
         return
@@ -825,53 +834,53 @@ def render_xlsx(pool):
                   key=lambda x: (x.get("首次入选日期") or "",
                                  x.get("首次入选时间") or "",
                                  x.get("代码") or ""))
-    MASTER_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    MASTER_HTML.parent.mkdir(parents=True, exist_ok=True)
+    n = len(HTML_COLS)
+    header_cells = "".join(f"<th>{_esc(c)}</th>" for c in HTML_COLS)
 
-    import openpyxl
-    from openpyxl.styles import Alignment, Font
-    from openpyxl.utils import get_column_letter
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "观察池"
-
-    n = len(XLSX_COLS)
-
-    def write_row(values):
-        ws.append(list(values))
-
-    def row_idx():
-        return ws.max_row
-
+    body_rows = []
     prev_date = None
     for r in rows:
         d = (r.get("首次入选日期") or "").strip() or "未知日期"
         if d != prev_date:
-            # 日期单独一整行：合并前 n 列 + 加粗（无背景色）
-            write_row([f"📅 {d}"] + [""] * (n - 1))
-            ws.merge_cells(start_row=row_idx(), start_column=1,
-                           end_row=row_idx(), end_column=n)
-            cell = ws.cell(row=row_idx(), column=1)
-            cell.font = Font(bold=True, size=12)
-            cell.alignment = Alignment(horizontal="left", vertical="center")
-            # 该日期表头（每个分组独立一份，深色字加粗）
-            write_row(XLSX_COLS)
-            for c in range(1, n + 1):
-                hc = ws.cell(row=row_idx(), column=c)
-                hc.font = Font(bold=True)
+            body_rows.append(
+                f'<tr class="date-row"><td colspan="{n}">📅 {_esc(d)}</td></tr>'
+            )
+            body_rows.append(f"<tr class=\"head-row\">{header_cells}</tr>")
             prev_date = d
-        write_row([str(r.get(c) or "").strip() for c in XLSX_COLS])
+        cells = "".join(f"<td>{_esc(r.get(c) or '')}</td>" for c in HTML_COLS)
+        body_rows.append(f"<tr>{cells}</tr>")
 
-    # 列宽按内容自适应（上限 42，避免「入选扫描时间点」这类长字段撑爆）
-    for c in range(1, n + 1):
-        letter = get_column_letter(c)
-        maxlen = max(len(str(ws.cell(row=rr, column=c).value or ""))
-                     for rr in range(1, ws.max_row + 1))
-        ws.column_dimensions[letter].width = min(max(maxlen + 2, 8), 42)
-    # 冻结首行（滚动时表头常驻）
-    ws.freeze_panes = "A2"
-
-    wb.save(MASTER_XLSX)
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>盘中累计观察池</title>
+<style>
+  body {{ font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         margin: 16px; color: #24292f; background: #fff; }}
+  h1 {{ font-size: 20px; margin: 8px 0 4px; }}
+  .meta {{ color: #57606a; font-size: 13px; margin-bottom: 12px; }}
+  .wrap {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; white-space: nowrap; font-size: 13px; }}
+  th, td {{ border: 1px solid #d0d7de; padding: 5px 10px; text-align: left; }}
+  th {{ background: #f6f8fa; font-weight: 600; position: sticky; top: 0; }}
+  .date-row td {{ background: #fff8e6; font-weight: 700; font-size: 14px;
+                  color: #9a6700; }}
+  tr:nth-child(even) {{ background: #fafbfc; }}
+</style>
+</head>
+<body>
+<h1>盘中累计观察池</h1>
+<div class="meta">自动生成，最新更新 {now_shanghai():%Y-%m-%d %H:%M} · 完整数据见同目录
+<a href="观察池_累计.csv">观察池_累计.csv</a>（Excel 打开按列对齐）</div>
+<div class="wrap"><table>
+{chr(10).join(body_rows)}
+</table></div>
+</body>
+</html>
+"""
+    MASTER_HTML.write_text(html, encoding="utf-8")
 
 
 
@@ -1447,7 +1456,7 @@ def main():
             else:
                 break
         _write_pool(pool)
-        render_xlsx(pool)
+        render_html(pool)
         print(f"[循环结束] 共 {iterations} 次扫描尝试，观察池共 {len(pool)} 只")
         if not git_sync_after():  # 统一 commit+push 一次，与云端互不冲突
             print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
@@ -1474,7 +1483,7 @@ def main():
         except Exception as e:
             print(f"[错误] 扫描失败: {type(e).__name__}: {e}")
     _write_pool(pool)
-    render_xlsx(pool)
+    render_html(pool)
     print(f"[累计] 观察池共 {len(pool)} 只")
     if not git_sync_after():  # 把本地本次扫描合并回仓库，与云端互为补充
         print("::warning::git 同步失败，本次增量保留在本地，下次运行会自动重试")
