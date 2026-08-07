@@ -39,7 +39,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: true
-          fetch-depth: 1   # 浅克隆：只拉最新提交，省掉完整历史（仓库含 CSV 增量，历史已很长）
+          # 注意：不要加 fetch-depth: 1！脚本冲突处理依赖 git pull --rebase，
+          # 浅克隆没有完整历史会导致 rebase 找不到 merge-base 而失败。
 
       - name: Set up Python
         uses: actions/setup-python@v7
