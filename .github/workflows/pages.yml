@@ -1,0 +1,46 @@
+name: 部署观察池到 GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mx_stocks_screener/观察池_累计.html'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备站点文件（html 作为首页）
+        run: |
+          mkdir -p _site
+          cp "mx_stocks_screener/观察池_累计.html" "_site/index.html"
+          cp "mx_stocks_screener/观察池_累计.csv" "_site/观察池_累计.csv"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
