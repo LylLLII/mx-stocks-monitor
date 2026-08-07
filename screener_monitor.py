@@ -801,27 +801,22 @@ def _write_pool(pool):
 # 列对齐由 Markdown 渲染保证，与 CSV 列数无关。
 MASTER_MD = OUTPUT_DIR / "观察池_累计.md"
 
-# .md 里展示的列（精选 12 列，避免列过多触发 GitHub 的"竖排表头"窄屏优化）。
-# 「入选扫描时间点」字段超长（拼了几十个时间戳），CSV 完整保留、md 不展示。
-# 选列原则：识别信息（代码/名称/板块）+ 盘中关键指标 + 策略收益核心三档。
-MD_COLS = [
-    "代码",
-    "名称",
-    "上市板块",
-    "量比",
-    "换手率(%)",
-    "涨停次数(近20日)",
-    "首次入选时间",
-    "入选时涨跌幅(%)",
-    "次日_跟踪状态",
-    "次日_收盘涨跌幅(%)",
-    "次日_形态",
-    "策略收益_次日收盘(%)",
-]
+# .md 表格的列：与 CSV 完全一致（全部保留）。
+# 日期分组用「整行绿色标题行」呈现（HTML <table> + colspan），
+# 列本身与 CSV 相同，Excel 打开的 csv 与 GitHub 的 md 内容一一对应。
+MD_COLS = MASTER_COLS
 
 
 def render_markdown(pool):
-    """把内存池渲染成按日期分组的 Markdown 表格，写盘到 MASTER_MD。"""
+    """把内存池渲染成按日期分组的 HTML 表格，写盘到 MASTER_MD。
+
+    GitHub Markdown 在列数过多时会触发「列头竖排」的窄屏优化，
+    视觉极差。改用 HTML <table> + 内联样式：
+      - 整行 <td colspan> 绿色背景作为日期分组标题（仿 Excel 风格）
+      - 每个日期分组自带表头（即使列再多也不会触发竖排）
+    GitHub 出于安全 sanitize 掉了大部分 HTML，但 <table>/<tr>/<th>/<td>
+    + colspan + 内联 style 是白名单内的，可以放心使用。
+    """
     if not pool:
         return
     rows = sorted(pool.values(),
@@ -829,28 +824,44 @@ def render_markdown(pool):
                                  x.get("首次入选时间") or "",
                                  x.get("代码") or ""))
     MASTER_MD.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
+
+    DATE_BG = "#28a745"      # 日期标题绿底（与 Bootstrap success 同色，醒目）
+    DATE_FG = "#ffffff"
+    HEAD_BG = "#f6f8fa"      # 表头浅灰底（GitHub 默认表格风格）
+    n = len(MD_COLS)
+    header_cells = "".join(f"<th>{c}</th>" for c in MD_COLS)
+
+    out = [
         f"# 盘中累计观察池（自动生成，最新更新 {now_shanghai():%Y-%m-%d %H:%M}）",
         "",
         "> 本文件由 `screener_monitor.py` 自动生成，请勿手动编辑。",
-        "> 数据同时以 CSV 形式保存在同目录 `观察池_累计.csv`（Excel 打开按列对齐）。",
+        "> 完整数据见同目录 `观察池_累计.csv`（Excel 打开按列对齐）。",
         "",
+        "<table>",
     ]
     prev_date = None
     for r in rows:
         d = (r.get("首次入选日期") or "").strip() or "未知日期"
         if d != prev_date:
-            # 每天一个分组标题 + 表头
-            lines.append(f"## 📅 {d}")
-            lines.append("")
-            lines.append("| " + " | ".join(MD_COLS) + " |")
-            lines.append("| " + " | ".join(["---"] * len(MD_COLS)) + " |")
+            # 整行绿色日期标题：colspan 占满表格 + 居中 + 加粗
+            out.append(
+                f'<tr><td colspan="{n}" '
+                f'style="background:{DATE_BG};color:{DATE_FG};'
+                f'font-weight:600;padding:8px 12px">📅 {d}</td></tr>'
+            )
+            # 该日期的表头（每个分组独立一份，避免跨分组列宽混乱）
+            out.append(
+                f'<tr>{"".join(f"<th style=\"background:{HEAD_BG};text-align:left;padding:6px 10px\">{c}</th>" for c in MD_COLS)}</tr>'
+            )
             prev_date = d
-        cells = [(r.get(c) or "").replace("|", "\\|").replace("\n", " ").strip()
-                 for c in MD_COLS]
-        lines.append("| " + " | ".join(cells) + " |")
-    lines.append("")
-    MASTER_MD.write_text("\n".join(lines), encoding="utf-8")
+        cells = "".join(
+            f"<td>{(r.get(c) or '').replace('|', '│').replace(chr(10), ' ').strip()}</td>"
+            for c in MD_COLS
+        )
+        out.append(f"<tr>{cells}</tr>")
+    out.append("</table>")
+    out.append("")
+    MASTER_MD.write_text("\n".join(out), encoding="utf-8")
 
 
 def _scan_once(pool, force):
