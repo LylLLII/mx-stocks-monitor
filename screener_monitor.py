@@ -644,6 +644,9 @@ def load_master() -> dict:
                 code = (r.get("代码") or "").strip()
                 if not code:
                     continue
+                # 跳过日期分隔标记行（#===== 2026-08-05 =====）：正常格式，静默跳过
+                if code.startswith("#"):
+                    continue
                 # 防 git 冲突标记固化：pull/merge 冲突残留的 <<<<<<< HEAD / ======= / >>>>>>> 行
                 # 会被 DictReader 解析成"代码"字段，若不拦截会被 _write_pool 原样写回并 commit 入库。
                 if code.startswith(("<<<<<<<", "=======", ">>>>>>>")):
@@ -754,9 +757,10 @@ def _write_pool(pool):
         if MASTER_CSV.exists():
             try:
                 with MASTER_CSV.open(encoding="utf-8-sig") as _f:
-                    # 跳过空行（日期分隔行）：只统计真实数据行
+                    # 跳过空行/标记行（日期分隔），只统计真实数据行
                     existing_rows = sum(1 for _r in csv.DictReader(_f)
-                                        if (_r.get("代码") or "").strip())
+                                        if (_r.get("代码") or "").strip()
+                                        and not (_r.get("代码") or "").lstrip().startswith("#"))
             except Exception:
                 existing_rows = 0
         if existing_rows > 0:
@@ -786,7 +790,9 @@ def _write_pool(pool):
                                        x.get("代码") or "")):
             d = (r.get("首次入选日期") or "")
             if prev_date is not None and d != prev_date:
-                f.write("\n")  # 日期分隔空行（DictWriter 不能写空行，直接写文件对象）
+                # 日期分隔标记行：GitHub 网页 CSV 预览会吞掉空行，改用可见的 # 标记行。
+                # csv.DictReader 把它解析为「代码」字段=#=====...，由 load_master 跳过。
+                f.write(f"#===== {d} =====\n")
             w.writerow(r)
             prev_date = d
 
