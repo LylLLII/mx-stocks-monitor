@@ -650,7 +650,9 @@ def load_master() -> dict:
                     print(f"[严重] 检测到 git 冲突标记行，已跳过（{code[:30]}...）。"
                           f"工作区可能残留未解决的合并冲突，请检查。")
                     continue
-                pool[code] = r
+                # 复合键 = 代码 + 首次入选日期：同一只票跨日期重新入选时各自成行（按批次独立跟踪 T+1）。
+                fd = (r.get("首次入选日期") or "").strip()
+                pool[f"{code}|{fd}" if fd else code] = r
     return pool
 
 
@@ -706,31 +708,36 @@ def git_sync_after():
 
 
 def _merge_rows(pool, rows, now):
-    """把本次命中合并进 pool（in-memory），返回 (added, updated) 代码列表。"""
+    """把本次命中合并进 pool（in-memory），返回 (added, updated) 代码列表。
+    语义：同一只票「同一日」多次命中 → 合并到当日行（刷新行情 + 计数 + 追加时间点）；
+    跨日期再次命中（如 8.5 入选后 8.7 又入选）→ 按「代码+入选日期」新开一行，各自独立跟踪 T+1。
+    历史行（之前日期的批次）保持冻结，仅由 track_followups 更新其 T+1 表现字段。"""
     ts = now.strftime("%Y-%m-%d %H:%M")
     date = now.strftime("%Y-%m-%d")
     time = now.strftime("%H:%M")
     added, updated = [], []
     for m in rows:
         code = m["代码"]
-        if code not in pool:
+        today_key = f"{code}|{date}"
+        if today_key not in pool:
+            # 今天首次命中（含跨日期重新入选）：新开一行，冻结今日入选快照
             snap_price, snap_pct = _snapshot_for_new(m)
             new = dict(m)
             new.update({
                 "首次入选日期": date, "首次入选时间": time,
-                # 冻结首次入选快照：以腾讯实时价（信号出现时）为基准，后续命中不再覆盖；
+                # 冻结本批次入选快照：以腾讯实时价（信号出现时）为基准，本行后续命中不再覆盖；
                 # 腾讯不可达时回退妙想最新价（见 _snapshot_for_new）。
                 # 注意：仅「入选价/入选时涨跌幅/首次入选日期+时间」冻结，
-                # 其余行情字段（量比/换手率/总市值等）每次重复命中都会刷新。
+                # 其余行情字段（量比/换手率/总市值等）当日重复命中会刷新。
                 "入选价(元)": snap_price, "入选时涨跌幅(%)": snap_pct,
                 "入选次数": "1", "入选扫描时间点": ts,
             })
-            pool[code] = new
+            pool[today_key] = new
             added.append(code)
         else:
-            # 重复命中：仅刷新行情快照字段（MAPPING 列出的量比/换手率等），
-            # 不触碰入选时间、入选价、入选次数等冻结字段。
-            ex = pool[code]
+            # 今日已命中过：仅刷新当日行的行情快照字段（MAPPING 列出的量比/换手率等），
+            # 不触碰本行冻结的入选时间、入选价；历史日期行（旧批次）不更新。
+            ex = pool[today_key]
             ex.update(m)
             ex["入选次数"] = str(int(ex.get("入选次数", "0") or 0) + 1)
             pts = [p for p in (ex.get("入选扫描时间点") or "").split(";") if p]
@@ -1082,7 +1089,9 @@ def track_followups(pool, force):
     today = now.date()
     after_close = now.time() >= datetime.strptime("15:00", "%H:%M").time()
     changed = False
-    for code, ex in pool.items():
+    for key, ex in pool.items():
+        # key 为「代码|入选日期」复合键；取数/打印一律用行内的真实代码
+        code = ex.get("代码") or (key.split("|")[0] if key else "")
         first_s = (ex.get("首次入选日期") or "").strip()
         if not first_s:
             continue
