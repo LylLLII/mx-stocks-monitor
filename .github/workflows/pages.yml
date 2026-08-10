@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - 'mx_stocks_screener/观察池_累计.html'
+  # 定时兜底部署：GitHub 防递归设计下，云端 workflow 用 GITHUB_TOKEN 的 push
+  # 不会触发本 workflow（本地用户凭据 push 才会），导致网站停在最后一次
+  # 本地 push。加 schedule 后无论数据由谁推送，网站每 5 分钟自动拉最新 HTML 重新部署。
+  schedule:
+    - cron: '*/5 1-3,5-7 * * 1-5'   # 北京交易时段每 5 分钟（与 monitor 同步节奏）
   workflow_dispatch:
 
 permissions:
