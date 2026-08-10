@@ -687,6 +687,56 @@ def _git(args):
         return False
 
 
+def _git_out(args):
+    """执行 git 命令并返回 (ok, stdout)。用于需要读取输出的场景（如 git show 取远端 CSV）。"""
+    try:
+        import subprocess
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run(["git"] + args, cwd=str(WORKSPACE),
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60,
+                           creationflags=creationflags)
+        return r.returncode == 0, (r.stdout or "")
+    except Exception:
+        return False, ""
+
+
+def _remote_covers_local():
+    """fetch 远端后比较：远端最新 CSV 的股票批次集合（代码+首次入选日期）是否已覆盖本地。
+
+    解决「同分钟双写」：本地任务与云端 Actions 恰好同分钟各自提交一份相同数据，
+    导致 push 被拒 → pull --rebase 撞 CSV 冲突 → rebase 卡死、后续多轮 git pull 失败。
+    若远端已包含本地全部批次（本地无独有数据），说明本轮是重复写入 → 放弃本地提交、
+    直接对齐远端即可，从根上避免冲突。返回 True 表示「应放弃本地提交」。
+    """
+    import csv
+    import io
+
+    def _keys(csv_text):
+        rows = list(csv.DictReader(io.StringIO(csv_text)))
+        return {(r.get("代码", "").strip(), r.get("首次入选日期", "").strip())
+                for r in rows if r.get("代码", "").strip()}
+
+    if not _git(["fetch", "origin"]):
+        return False  # fetch 失败（网络？）→ 保守走原逻辑
+    # git show 需要仓库相对路径（如 mx_stocks_screener/观察池_累计.csv），不能用文件名
+    rel = MASTER_CSV.relative_to(WORKSPACE).as_posix()
+    ok, text = _git_out(["show", f"origin/main:{rel}"])
+    if not ok or not text:
+        return False
+    try:
+        remote_keys = _keys(text.lstrip("\ufeff"))
+        local_text = MASTER_CSV.read_text(encoding="utf-8-sig")
+        local_keys = _keys(local_text.lstrip("\ufeff"))
+    except Exception:
+        return False
+    if not local_keys:
+        return False  # 本地空池不放弃（防御）
+    return local_keys <= remote_keys
+
+
 def git_sync_before() -> bool:
     """拉取远端最新观察池。失败返回 False——调用方必须跳过本轮（不扫描、不写盘），
     否则会基于旧数据扫描，且 pull 冲突残留的标记可能被 load_master 读入并固化。
@@ -713,6 +763,12 @@ def git_sync_after():
     if not _has_data_changes():
         # CSV 无实际变化（收盘后 T+1 已全部跟踪完、无新入选）→ 不提交不推送
         print("[git] 观察池数据无变化，跳过 commit/push（仅 HTML 时间戳更新不构成提交理由）")
+        return True
+    if _remote_covers_local():
+        # 同分钟双写：云端已在同一分钟推送了相同批次集合（本地无独有数据）→
+        # 放弃本地提交、直接对齐远端，从根上避免 push 被拒 → rebase 冲突卡死。
+        print("[git] 远端已包含本地全部批次（同分钟双写），放弃本地提交，对齐远端")
+        _git(["reset", "--hard", "origin/main"])
         return True
     _git(["add", str(MASTER_CSV)])
     if MASTER_HTML.exists():
