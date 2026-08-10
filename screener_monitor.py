@@ -704,21 +704,17 @@ def _git_out(args):
 
 
 def _remote_covers_local():
-    """fetch 远端后比较：远端最新 CSV 的股票批次集合（代码+首次入选日期）是否已覆盖本地。
+    """fetch 远端后比较：远端最新 CSV 与本地是否完全一致。
 
     解决「同分钟双写」：本地任务与云端 Actions 恰好同分钟各自提交一份相同数据，
     导致 push 被拒 → pull --rebase 撞 CSV 冲突 → rebase 卡死、后续多轮 git pull 失败。
-    若远端已包含本地全部批次（本地无独有数据），说明本轮是重复写入 → 放弃本地提交、
-    直接对齐远端即可，从根上避免冲突。返回 True 表示「应放弃本地提交」。
+    若远端 CSV 与本地【逐字节一致】，说明本轮是重复写入 → 放弃本地提交、直接对齐远端。
+
+    ⚠️ 必须比较完整内容而非仅批次集合：交易时段 T+1 盘中数据（次日_当前涨跌幅等）
+    随时在变，若只比较「代码+首次入选日期」集合，T+1 更新会被误判为重复双写而
+    被 git reset --hard 丢弃 → 远端/网站永远停在旧数据。内容一致才算重复。
+    返回 True 表示「应放弃本地提交」。
     """
-    import csv
-    import io
-
-    def _keys(csv_text):
-        rows = list(csv.DictReader(io.StringIO(csv_text)))
-        return {(r.get("代码", "").strip(), r.get("首次入选日期", "").strip())
-                for r in rows if r.get("代码", "").strip()}
-
     if not _git(["fetch", "origin"]):
         return False  # fetch 失败（网络？）→ 保守走原逻辑
     # git show 需要仓库相对路径（如 mx_stocks_screener/观察池_累计.csv），不能用文件名
@@ -727,14 +723,13 @@ def _remote_covers_local():
     if not ok or not text:
         return False
     try:
-        remote_keys = _keys(text.lstrip("\ufeff"))
-        local_text = MASTER_CSV.read_text(encoding="utf-8-sig")
-        local_keys = _keys(local_text.lstrip("\ufeff"))
+        remote_text = text.lstrip("\ufeff").strip()
+        local_text = MASTER_CSV.read_text(encoding="utf-8-sig").lstrip("\ufeff").strip()
     except Exception:
         return False
-    if not local_keys:
+    if not local_text:
         return False  # 本地空池不放弃（防御）
-    return local_keys <= remote_keys
+    return local_text == remote_text
 
 
 def git_sync_before() -> bool:
