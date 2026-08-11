@@ -880,7 +880,8 @@ HTML_COLS = MASTER_COLS
 def _esc(v):
     """HTML 转义 + 超长单元格截断，防注入/防表格爆炸。"""
     import html as _html
-    s = str(v or "")
+    # 注意：不能用 `v or ""`，否则 float 0.0 会被当作 falsy 吞成空字符串。
+    s = str(v) if v is not None else ""
     s = _html.escape(s)
     if len(s) > 60:
         s = s[:60] + "…"
@@ -935,7 +936,10 @@ def render_html(pool):
             prev_date = d
         cells = []
         for c in HTML_COLS:
-            raw = r.get(c) or ""
+            # 注意：不能用 `r.get(c) or ""`，否则 float 0.0（如最低价=昨收时
+            # 涨跌幅=0.0）会被当作 falsy 吞成空字符串，HTML 显示为空。
+            _v = r.get(c)
+            raw = "" if _v is None else str(_v)
             if c == "名称":
                 href, text = _quote_link(r.get("代码"), raw)
                 cells.append(
