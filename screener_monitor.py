@@ -950,6 +950,20 @@ def render_html(pool):
                 cells.append(f"<td>{_esc(raw)}</td>")
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
 
+    # 点击行选中/取消选中的交互脚本（普通字符串，避免 f-string 转义大括号）
+    _row_select_js = """
+<script>
+document.querySelector('.wrap table').addEventListener('click', function (e) {
+  var tr = e.target.closest('tr');
+  if (!tr || tr.classList.contains('date-row') || tr.classList.contains('head-row')) return;
+  var was = tr.classList.contains('selected');
+  document.querySelectorAll('tr.selected').forEach(function (r) {
+    r.classList.remove('selected');
+  });
+  if (!was) tr.classList.add('selected');
+});
+</script>"""
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -967,6 +981,12 @@ def render_html(pool):
   .date-row td {{ background: #fff8e6; font-weight: 700; font-size: 14px;
                   color: #9a6700; }}
   tr:nth-child(even) {{ background: #fafbfc; }}
+  /* 鼠标悬停：数据行整体加深（日期行/表头行除外） */
+  tr:not(.date-row):not(.head-row) {{ cursor: pointer; }}
+  tr:not(.date-row):not(.head-row):hover td {{ background: #d0e7ff; }}
+  /* 点击选中：该行保持深色标识，再次点击取消 */
+  tr.selected td {{ background: #0969da; color: #fff; font-weight: 600; }}
+  tr.selected td a {{ color: #fff; }}
   td a {{ color: #0969da; text-decoration: none; }}
   td a:hover {{ text-decoration: underline; }}
 </style>
@@ -978,6 +998,7 @@ def render_html(pool):
 <div class="wrap"><table>
 {chr(10).join(body_rows)}
 </table></div>
+{_row_select_js}
 </body>
 </html>
 """

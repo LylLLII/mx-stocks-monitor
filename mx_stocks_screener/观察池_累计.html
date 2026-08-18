@@ -15,6 +15,12 @@
   .date-row td { background: #fff8e6; font-weight: 700; font-size: 14px;
                   color: #9a6700; }
   tr:nth-child(even) { background: #fafbfc; }
+  /* 鼠标悬停：数据行整体加深（日期行/表头行除外） */
+  tr:not(.date-row):not(.head-row) { cursor: pointer; }
+  tr:not(.date-row):not(.head-row):hover td { background: #d0e7ff; }
+  /* 点击选中：该行保持深色标识，再次点击取消 */
+  tr.selected td { background: #0969da; color: #fff; font-weight: 600; }
+  tr.selected td a { color: #fff; }
   td a { color: #0969da; text-decoration: none; }
   td a:hover { text-decoration: underline; }
 </style>
@@ -108,5 +114,16 @@
 <tr><td>002655</td><td><a href="https://quote.eastmoney.com/sz002655.html" target="_blank" rel="noopener">共达电声</a></td><td>深交所主板</td><td>2.60</td><td>5.75</td><td>133.69亿</td><td>2</td><td>否</td><td>否</td><td>-</td><td>2026-08-18</td><td>10:17</td><td>36.62</td><td>4.39</td><td>9</td><td>2026-08-18 10:17;2026-08-18 10:17;2026-08-18 10:20;2026-08-1…</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
 <tr><td>002703</td><td><a href="https://quote.eastmoney.com/sz002703.html" target="_blank" rel="noopener">浙江世宝</a></td><td>深交所主板</td><td>2.54</td><td>5.76</td><td>125.12亿</td><td>2</td><td>否</td><td>否</td><td>-</td><td>2026-08-18</td><td>10:17</td><td>15.2</td><td>3.26</td><td>9</td><td>2026-08-18 10:17;2026-08-18 10:17;2026-08-18 10:20;2026-08-1…</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
 </table></div>
+<script>
+document.querySelector('.wrap table').addEventListener('click', function (e) {
+  var tr = e.target.closest('tr');
+  if (!tr || tr.classList.contains('date-row') || tr.classList.contains('head-row')) return;
+  var was = tr.classList.contains('selected');
+  document.querySelectorAll('tr.selected').forEach(function (r) {
+    r.classList.remove('selected');
+  });
+  if (!was) tr.classList.add('selected');
+});
+</script>
 </body>
 </html>
