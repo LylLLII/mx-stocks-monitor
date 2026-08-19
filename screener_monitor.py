@@ -1369,15 +1369,21 @@ def track_followups(pool, force):
                 # 当前涨跌幅：每次刷新（实时）；仅开盘后(>=9:30)抓取，盘前无真实现价不写
                 if price and price > 0 and now.time() >= datetime.strptime("09:30", "%H:%M").time():
                     ex["次日_当前涨跌幅"] = _p(price); changed = True
-                # 开盘涨跌幅：开盘后即固定，抓一次即可；仅在开盘后且为有效正值时抓
-                # （盘前 open 可能为 0，避免锁定错误开盘涨跌幅）
-                if o and o > 0 and not ex.get("次日_开盘涨跌幅"):
-                    ex["次日_开盘涨跌幅"] = _p(o); changed = True
-                # 最高/最低涨跌幅：日内实时极值，每次刷新；仅在有效正值时抓
-                if h and h > 0:
-                    ex["次日_最高涨跌幅"] = _p(h); changed = True
-                if l and l > 0:
-                    ex["次日_最低涨跌幅"] = _p(l); changed = True
+                # 开/高/低同「当前涨跌幅」一样仅开盘后(>=9:30)才写：盘前（云端 cron 9:00
+                # 即开跑，早于 9:15 集合竞价）腾讯接口「昨收」已滚到 T 日收盘，但「今开」
+                # 仍挂 T 日旧值、「最高/最低」已等于昨收，此时写入会把 T 日数据误标成 T+1
+                # （曾出现：开盘=1.29 为 T 日旧开盘、最高/最低恰为 0.0 的污染数据）。
+                if now.time() >= datetime.strptime("09:30", "%H:%M").time():
+                    # 开盘涨跌幅：9:25 竞价撮合后即固定；「跟踪中」状态每次覆写以自愈
+                    # 盘前误写值，已跟踪/已补抓/T+1停牌后冻结（由收盘分支最终固化）
+                    if o and o > 0 and (not ex.get("次日_开盘涨跌幅")
+                                        or (ex.get("次日_跟踪状态") or "") == "跟踪中"):
+                        ex["次日_开盘涨跌幅"] = _p(o); changed = True
+                    # 最高/最低涨跌幅：日内实时极值，每次刷新；仅在有效正值时抓
+                    if h and h > 0:
+                        ex["次日_最高涨跌幅"] = _p(h); changed = True
+                    if l and l > 0:
+                        ex["次日_最低涨跌幅"] = _p(l); changed = True
                 # 午间涨跌幅：11:30 之后可得，抓一次即固化
                 if now.time() >= datetime.strptime("11:30", "%H:%M").time() and not ex.get("次日_午间涨跌幅"):
                     m = _fetch_mid_price(code, plate, target)
