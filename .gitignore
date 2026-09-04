@@ -22,3 +22,8 @@ monitor.log
 .env
 *.env
 !*.env.example
+
+# 【硬性规则】本地私有文件，严禁入库（任何 git add 方式均被忽略，含 git add -A）。
+# 观察池_操作.html 含个人交易策略操作清单，只允许存在本地。
+mx_stocks_screener/观察池_操作.html
+
