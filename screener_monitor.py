@@ -989,9 +989,15 @@ document.querySelector('.wrap table').addEventListener('click', function (e) {
   tr.selected td a {{ color: #fff; }}
   td a {{ color: #0969da; text-decoration: none; }}
   td a:hover {{ text-decoration: underline; }}
+  .ops-btn {{ position: fixed; top: 14px; right: 16px; z-index: 9;
+             background: #0969da; color: #fff; text-decoration: none;
+             padding: 7px 14px; border-radius: 8px; font-size: 14px; font-weight: 600;
+             box-shadow: 0 1px 4px rgba(0,0,0,.15); }}
+  .ops-btn:hover {{ background: #0860c4; }}
 </style>
 </head>
 <body>
+<a class="ops-btn" href="观察池_操作.html">🎯 操作清单</a>
 <h1>盘中累计观察池</h1>
 <div class="meta">自动生成，最新更新 {now_shanghai():%Y-%m-%d %H:%M} · 完整数据见同目录
 <a href="观察池_累计.csv">观察池_累计.csv</a>（Excel 打开按列对齐）</div>
