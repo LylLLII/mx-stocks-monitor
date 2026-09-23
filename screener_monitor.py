@@ -425,15 +425,27 @@ def now_shanghai() -> datetime:
         return (datetime.now(timezone.utc) + timedelta(hours=8)).replace(tzinfo=None)
 
 
-def in_trading_hours(dt: datetime) -> bool:
-    # 先判交易日：跳过周末与法定节假日（chinese_calendar 不可用时退化为仅判周末）
+def is_trading_day(d) -> bool:
+    """A 股交易日判定：周一~周五 且 非法定节假日。
+
+    不可用 chinese_calendar.is_workday()——它把「周末调休上班日」也算作工作日
+    （2026-09-20 周日、2026-10-10 周六均为国庆调休上班日），但交易所周末一律不开市。
+    曾因此把 2026-09-18(周五) 入选股的 T+1 误算成 09-20(周日)：当天既无行情、云端 cron
+    也不运行，6 只个股的次日跟踪被判「已过期」，涨跌幅字段永久留空。"""
+    if d.weekday() >= 5:            # 周末（含调休上班日）一律不是交易日
+        return False
     try:
         import chinese_calendar as cn
-        if not cn.is_workday(dt.date()):
-            return False
+        return not cn.is_holiday(d)
     except Exception:
-        if dt.weekday() >= 5:
-            return False
+        # 日历库未安装 / 该年份超出库数据范围 → 退化为「周一~周五」
+        return True
+
+
+def in_trading_hours(dt: datetime) -> bool:
+    # 先判交易日：周末（含调休上班日）与法定节假日均不开市
+    if not is_trading_day(dt.date()):
+        return False
     t = dt.time()
     morning = datetime.strptime("09:30", "%H:%M").time() <= t <= datetime.strptime("11:30", "%H:%M").time()
     afternoon = datetime.strptime("13:00", "%H:%M").time() <= t <= datetime.strptime("15:00", "%H:%M").time()
@@ -1091,19 +1103,10 @@ def _tx_prefix(code, plate):
 
 def _next_trading_day(d):
     """返回 d 之后的第一个交易日（排除周末与法定节假日）。"""
-    try:
-        import chinese_calendar as cn
-        nd = d
-        while True:
-            nd = nd + timedelta(days=1)
-            if cn.is_workday(nd):
-                return nd
-    except Exception:
-        pass
     nd = d
     while True:
         nd = nd + timedelta(days=1)
-        if nd.weekday() < 5:
+        if is_trading_day(nd):
             return nd
 
 
